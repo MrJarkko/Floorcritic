@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 
 const DANCES = {
   Standard: ["Waltz", "Tango", "Viennese Waltz", "Foxtrot", "Quickstep"],
@@ -97,6 +97,23 @@ function CoupleCard({ couple, rank, color, expanded, onToggle }) {
 
       {expanded && couple.scores && (
         <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+
+          {/* Large image at top of expanded view */}
+          {couple.thumbnail && (
+            <div
+              onClick={(e) => { e.stopPropagation(); window.dispatchEvent(new CustomEvent("floorcritic:viewimage", { detail: { src: couple.thumbnail, number: couple.number, hint: couple.thumbnail_hint } })); }}
+              style={{ marginBottom: 16, borderRadius: 10, overflow: "hidden", border: "1px solid rgba(255,255,255,0.08)", position: "relative", cursor: "zoom-in", background: "#000" }}>
+              <img
+                src={`data:image/jpeg;base64,${couple.thumbnail}`}
+                alt={`Couple ${couple.number ?? ""}`}
+                style={{ width: "100%", display: "block", maxHeight: 360, objectFit: "contain", background: "#000" }}
+              />
+              <div style={{ position: "absolute", bottom: 8, right: 8, background: "rgba(0,0,0,0.6)", backdropFilter: "blur(4px)", borderRadius: 6, padding: "4px 8px", fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#f0ece0", letterSpacing: 1 }}>
+                ⤢ TAP TO ZOOM
+              </div>
+            </div>
+          )}
+
           <div style={{ display: "grid", gap: 10 }}>
             {Object.entries(couple.scores).map(([criterion, score]) => (
               <div key={criterion}>
@@ -144,6 +161,7 @@ export default function FloorCritic() {
   const [numCouples, setNumCouples] = useState(6);
   const [myCoupleEnabled, setMyCoupleEnabled] = useState(false);
   const [myCouple, setMyCouple] = useState(null); // bib number the user wants tracked
+  const [imageViewer, setImageViewer] = useState(null); // { src, number, hint } or null
   const [competition, setCompetition] = useState("");
   const [round, setRound] = useState("Heat");
   const [videos, setVideos] = useState([]); // array of { file, url, id }
@@ -156,6 +174,21 @@ export default function FloorCritic() {
   const fileRef = useRef();
 
   const MAX_VIDEOS = 3;
+
+  // Listen for image-zoom events from CoupleCard
+  useEffect(() => {
+    const handler = (e) => setImageViewer(e.detail);
+    window.addEventListener("floorcritic:viewimage", handler);
+    return () => window.removeEventListener("floorcritic:viewimage", handler);
+  }, []);
+
+  // Close viewer on Escape
+  useEffect(() => {
+    if (!imageViewer) return;
+    const onKey = (e) => { if (e.key === "Escape") setImageViewer(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [imageViewer]);
 
   const handleFiles = (fileList) => {
     if (!fileList) return;
@@ -247,8 +280,12 @@ export default function FloorCritic() {
 
     // Step 2: extract each frame via -ss seek
     const frames = [];
+    // Skip first 10% and last 10% (lineup/bowing segments)
+    const startPad = duration * 0.10;
+    const active = duration * 0.80;
+
     for (let i = 0; i < count; i++) {
-      const t = (duration / (count + 1)) * (i + 1);
+      const t = startPad + (active / (count + 1)) * (i + 1);
       setProgress(`Extracting frame ${i + 1} of ${count}…`);
       const outName = `frame_${i}.jpg`;
       await ffmpeg.exec([
@@ -267,7 +304,7 @@ export default function FloorCritic() {
       for (let j = 0; j < bytes.length; j += chunk) {
         binary += String.fromCharCode.apply(null, bytes.subarray(j, j + chunk));
       }
-      frames.push(btoa(binary));
+      frames.push({ b64: btoa(binary), t });
       await ffmpeg.deleteFile(outName);
     }
     await ffmpeg.deleteFile(inputName);
@@ -314,7 +351,11 @@ export default function FloorCritic() {
           return;
         }
 
-        const times = Array.from({ length: count }, (_, i) => (duration / (count + 1)) * (i + 1));
+        // Skip first 10% and last 10% of video (typically lineup / bowing)
+        const startPad = duration * 0.10;
+        const endPad = duration * 0.90;
+        const active = endPad - startPad;
+        const times = Array.from({ length: count }, (_, i) => startPad + (active / (count + 1)) * (i + 1));
         let idx = 0;
         const capture = () => {
           if (idx >= times.length) {
@@ -337,7 +378,7 @@ export default function FloorCritic() {
             if (dataUrl === "data:," || dataUrl.length < 1000) {
               console.warn("Frame", idx, "appears empty — codec decode may have failed");
             } else {
-              frames.push(dataUrl.split(",")[1]);
+              frames.push({ b64: dataUrl.split(",")[1], t: times[idx] });
             }
             idx++;
             capture();
@@ -369,7 +410,9 @@ export default function FloorCritic() {
     try {
       // Extract frames from every uploaded video
       const allFrames = []; // { videoIndex, angleLabel, b64 }
-      const framesPerVideo = videos.length === 1 ? 8 : videos.length === 2 ? 5 : 4;
+      // More frames = better temporal coverage for musicality analysis
+      // 20 frames per video gives ~1 frame per 3s on a 60s video - enough to see beat patterns
+      const framesPerVideo = videos.length === 1 ? 24 : videos.length === 2 ? 16 : 12;
 
       for (let i = 0; i < videos.length; i++) {
         const v = videos[i];
@@ -393,7 +436,7 @@ export default function FloorCritic() {
         if (!frames || frames.length === 0) {
           throw new Error(`No frames extracted from video ${i + 1}. Check format.`);
         }
-        frames.forEach(b64 => allFrames.push({ videoIndex: i, angleLabel, b64 }));
+        frames.forEach(f => allFrames.push({ videoIndex: i, angleLabel, b64: f.b64, t: f.t }));
       }
 
       console.log(`Total frames extracted: ${allFrames.length} across ${videos.length} video(s)`);
@@ -405,6 +448,14 @@ export default function FloorCritic() {
       const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance coaching assistant analysing competition footage. You provide constructive technical feedback on dance technique using WDSF adjudication criteria.
 
 ${multiVideo ? `IMPORTANT: You are receiving frames from ${videos.length} DIFFERENT camera angles of the SAME heat/round. Synthesise observations across all angles for each couple — different angles reveal different technical details (footwork, posture, spacing). Frames are labelled with their angle.` : ""}
+
+TEMPORAL ANALYSIS — CRITICAL:
+- You are receiving ${framesPerVideo} frames per video, extracted at evenly-spaced moments throughout the dance.
+- Analyse the PROGRESSION across frames: how body positions, footwork, shapes, and spacing evolve over time.
+- For TIMING & MUSICALITY: look at how couples move BETWEEN frames. ${dance === "Waltz" || dance === "Viennese Waltz" ? "For waltz, check the 1-2-3 timing pattern and rise-and-fall flow between frames." : dance === "Tango" ? "For tango, check staccato accents and held positions." : dance === "Quickstep" ? "For quickstep, check the rhythmic pattern (slow-quick-quick) and lightness between frames." : dance === "Cha Cha" ? "For cha cha, check the cha-cha-cha split-beat timing visible in leg positions between frames." : dance === "Samba" ? "For samba, check the bounce action and pendulum movement evolution." : dance === "Rumba" ? "For rumba, check the 2-3-4-1 timing with slow hip action between frames." : "Check how movement aligns with the typical rhythm of this dance."}
+- For FLOOR CRAFT: compare spacing and position changes across frames to spot collisions or good navigation.
+- For PRESENTATION: assess consistency across the entire performance, not just isolated moments.
+- Explicitly note if a couple appears OFF TIME or OUT OF SYNC based on positions between frames.
 
 COUPLE IDENTIFICATION (CRITICAL):
 - Each couple wears a BIB NUMBER pinned to the man's back (typically a large printed number).
@@ -420,6 +471,7 @@ JSON structure:
   "dance": "${dance}",
   "round": "${round}",
   "angles_analysed": ${videos.length},
+  "frames_analysed": ${videos.length * framesPerVideo},
   "ranked_couples": [
     {
       "number": <bib number integer from the male's back, or null if unreadable>,
@@ -460,13 +512,14 @@ Be specific, objective and honest — this is for competitive analysis.`
         },
       ];
 
-      // Interleave angle labels before each video's frames
+      // Interleave angle labels + per-frame timestamps before each image
       let currentAngle = -1;
       for (const frame of allFrames) {
         if (frame.videoIndex !== currentAngle) {
-          userContent.push({ type: "text", text: `— ${frame.angleLabel} —` });
+          userContent.push({ type: "text", text: `\n═══ ${frame.angleLabel} ═══` });
           currentAngle = frame.videoIndex;
         }
+        userContent.push({ type: "text", text: `[t = ${frame.t.toFixed(1)}s]` });
         userContent.push({
           type: "image",
           source: { type: "base64", media_type: "image/jpeg", data: frame.b64 }
@@ -556,6 +609,7 @@ Be specific, objective and honest — this is for competitive analysis.`
         input[type=range] { -webkit-appearance: none; width: 100%; height: 4px; background: rgba(255,255,255,0.12); border-radius: 2px; outline: none; }
         input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #E8C547; cursor: pointer; }
         @keyframes fadeUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes pulse { 0%,100% { opacity: 0.5; } 50% { opacity: 1; } }
       `}</style>
@@ -827,6 +881,45 @@ Be specific, objective and honest — this is for competitive analysis.`
           </div>
         )}
       </div>
+
+      {/* Fullscreen image viewer */}
+      {imageViewer && (
+        <div
+          onClick={() => setImageViewer(null)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.92)", zIndex: 1000,
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+            padding: "20px", animation: "fadeIn 0.2s ease",
+          }}>
+          <button
+            onClick={(e) => { e.stopPropagation(); setImageViewer(null); }}
+            style={{
+              position: "absolute", top: 16, right: 16, width: 40, height: 40, borderRadius: "50%",
+              border: "1px solid rgba(255,255,255,0.2)", background: "rgba(0,0,0,0.5)", color: "#f0ece0",
+              fontFamily: "'DM Mono', monospace", fontSize: 18, cursor: "pointer", zIndex: 1001,
+            }}>✕</button>
+
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.5)", letterSpacing: 2, marginBottom: 12, textTransform: "uppercase" }}>
+            {imageViewer.number != null ? `Couple #${imageViewer.number}` : "Unknown couple"}
+          </div>
+
+          <img
+            src={`data:image/jpeg;base64,${imageViewer.src}`}
+            alt={`Couple ${imageViewer.number ?? ""}`}
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: "100%", maxHeight: "80vh", objectFit: "contain", borderRadius: 8 }}
+          />
+
+          {imageViewer.hint && (
+            <div style={{ marginTop: 14, fontFamily: "'Lora', serif", fontStyle: "italic", fontSize: 13, color: "rgba(240,236,224,0.6)", textAlign: "center", maxWidth: 500 }}>
+              {imageViewer.hint}
+            </div>
+          )}
+          <div style={{ marginTop: 20, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.3)", letterSpacing: 1 }}>
+            TAP ANYWHERE OR PRESS ESC TO CLOSE
+          </div>
+        </div>
+      )}
     </div>
   );
 }
