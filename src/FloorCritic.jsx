@@ -29,6 +29,10 @@ function ScoreBar({ score, max = 10 }) {
 }
 
 function CoupleCard({ couple, rank, color, expanded, onToggle }) {
+  const hasNumber = couple.number != null;
+  const displayNumber = hasNumber ? `#${couple.number}` : "Unknown #";
+  const confidenceDot = couple.number_confidence === "low" ? "🟡" : couple.number_confidence === "medium" ? "🟠" : "";
+
   return (
     <div
       onClick={onToggle}
@@ -36,34 +40,59 @@ function CoupleCard({ couple, rank, color, expanded, onToggle }) {
         background: expanded ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.03)",
         border: `1px solid ${expanded ? color : "rgba(255,255,255,0.08)"}`,
         borderRadius: 12,
-        padding: "16px 20px",
+        padding: "12px 14px",
         cursor: "pointer",
         transition: "all 0.2s ease",
         marginBottom: 10,
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        {/* Rank circle */}
         <div style={{
-          width: 36, height: 36, borderRadius: "50%", background: color,
+          width: 32, height: 32, borderRadius: "50%", background: color,
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontFamily: "'Playfair Display', serif", fontWeight: 700, fontSize: 15, color: "#0a0a0f", flexShrink: 0,
+          fontFamily: "'Playfair Display', serif", fontWeight: 700, fontSize: 14, color: "#0a0a0f", flexShrink: 0,
         }}>
           {rank}
         </div>
-        <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-            <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 16, color: "#f0ece0" }}>
-              Couple #{couple.number}
-            </span>
-            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.4)", letterSpacing: 1 }}>
-              {couple.nation || ""}
+
+        {/* Thumbnail */}
+        {couple.thumbnail ? (
+          <div style={{
+            width: 54, height: 54, borderRadius: 8, overflow: "hidden", flexShrink: 0,
+            background: "#000", border: "1px solid rgba(255,255,255,0.08)",
+          }}>
+            <img
+              src={`data:image/jpeg;base64,${couple.thumbnail}`}
+              alt={`Couple ${couple.number ?? ""}`}
+              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            />
+          </div>
+        ) : (
+          <div style={{
+            width: 54, height: 54, borderRadius: 8, flexShrink: 0,
+            background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 20, opacity: 0.3,
+          }}>💃</div>
+        )}
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: "'Playfair Display', serif", fontSize: 15, color: hasNumber ? "#f0ece0" : "rgba(240,236,224,0.6)" }}>
+              Couple {displayNumber} {confidenceDot}
             </span>
           </div>
-          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.5)", marginTop: 2 }}>
+          {couple.thumbnail_hint && (
+            <div style={{ fontFamily: "'Lora', serif", fontStyle: "italic", fontSize: 11, color: "rgba(240,236,224,0.45)", marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {couple.thumbnail_hint}
+            </div>
+          )}
+          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.5)", marginTop: 2 }}>
             Overall: {couple.overall?.toFixed(1) ?? "—"} / 10
           </div>
         </div>
-        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.4)", transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}>▼</div>
+        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.4)", transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s", flexShrink: 0 }}>▼</div>
       </div>
 
       {expanded && couple.scores && (
@@ -113,23 +142,38 @@ export default function FloorCritic() {
   const [danceStyle, setDanceStyle] = useState("Standard");
   const [dance, setDance] = useState("Waltz");
   const [numCouples, setNumCouples] = useState(6);
-  const [myCouple, setMyCouple] = useState(null);
+  const [myCoupleEnabled, setMyCoupleEnabled] = useState(false);
+  const [myCouple, setMyCouple] = useState(null); // bib number the user wants tracked
   const [competition, setCompetition] = useState("");
   const [round, setRound] = useState("Heat");
-  const [videoFile, setVideoFile] = useState(null);
-  const [videoUrl, setVideoUrl] = useState(null);
+  const [videos, setVideos] = useState([]); // array of { file, url, id }
   const [results, setResults] = useState(null);
   const [expandedCouple, setExpandedCouple] = useState(null);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState("");
-  const [ffmpegStatus, setFfmpegStatus] = useState("idle"); // idle | loading | ready
+  const [ffmpegStatus, setFfmpegStatus] = useState("idle");
   const ffmpegRef = useRef(null);
   const fileRef = useRef();
 
-  const handleFile = (f) => {
-    if (!f) return;
-    setVideoFile(f);
-    setVideoUrl(URL.createObjectURL(f));
+  const MAX_VIDEOS = 3;
+
+  const handleFiles = (fileList) => {
+    if (!fileList) return;
+    const newFiles = Array.from(fileList).slice(0, MAX_VIDEOS - videos.length);
+    const additions = newFiles.map(file => ({
+      file,
+      url: URL.createObjectURL(file),
+      id: Math.random().toString(36).slice(2, 9),
+    }));
+    setVideos(prev => [...prev, ...additions].slice(0, MAX_VIDEOS));
+  };
+
+  const removeVideo = (id) => {
+    setVideos(prev => {
+      const toRemove = prev.find(v => v.id === id);
+      if (toRemove) URL.revokeObjectURL(toRemove.url);
+      return prev.filter(v => v.id !== id);
+    });
   };
 
   // ─── FFmpeg.wasm loader (proper npm imports, works on any domain) ───
@@ -318,92 +362,121 @@ export default function FloorCritic() {
   }, []);
 
   const analyse = async () => {
-    if (!videoFile) return;
+    if (videos.length === 0) return;
     setStep("analysing");
     setError(null);
 
     try {
-      setProgress("Extracting frames from video…");
-      let frames = [];
+      // Extract frames from every uploaded video
+      const allFrames = []; // { videoIndex, angleLabel, b64 }
+      const framesPerVideo = videos.length === 1 ? 8 : videos.length === 2 ? 5 : 4;
 
-      // Try native browser extraction first (fast, free)
-      try {
-        frames = await extractFrames(videoFile, 6);
-      } catch (nativeErr) {
-        console.warn("Native extraction failed:", nativeErr.message);
-        // Heuristic: if the error suggests codec issues, try ffmpeg.wasm
-        const msg = nativeErr.message.toLowerCase();
-        const isCodecIssue = msg.includes("hevc") || msg.includes("h.265") || msg.includes("codec") || msg.includes("could not be loaded") || msg.includes("dimensions");
-        if (isCodecIssue) {
-          setProgress("Browser cannot decode this codec. Falling back to in-browser converter…");
-          frames = await extractFramesFFmpeg(videoFile, 6);
-        } else {
-          throw nativeErr;
+      for (let i = 0; i < videos.length; i++) {
+        const v = videos[i];
+        const angleLabel = videos.length === 1 ? "Main view" : `Angle ${i + 1}`;
+        setProgress(`Extracting frames from video ${i + 1} of ${videos.length}…`);
+
+        let frames = [];
+        try {
+          frames = await extractFrames(v.file, framesPerVideo);
+        } catch (nativeErr) {
+          const msg = nativeErr.message.toLowerCase();
+          const isCodecIssue = msg.includes("hevc") || msg.includes("h.265") || msg.includes("codec") || msg.includes("could not be loaded") || msg.includes("dimensions");
+          if (isCodecIssue) {
+            setProgress(`Converting video ${i + 1} (HEVC → JPEG)…`);
+            frames = await extractFramesFFmpeg(v.file, framesPerVideo);
+          } else {
+            throw nativeErr;
+          }
         }
+
+        if (!frames || frames.length === 0) {
+          throw new Error(`No frames extracted from video ${i + 1}. Check format.`);
+        }
+        frames.forEach(b64 => allFrames.push({ videoIndex: i, angleLabel, b64 }));
       }
 
-      if (!frames || frames.length === 0) {
-        throw new Error("No frames could be extracted. Check video format.");
-      }
-      console.log(`Extracted ${frames.length} frames.`);
-
-      setProgress(`Sending ${frames.length} frames to AI for WDSF analysis…`);
+      console.log(`Total frames extracted: ${allFrames.length} across ${videos.length} video(s)`);
+      setProgress(`Sending ${allFrames.length} frames to AI for WDSF analysis…`);
 
       const criteria = WDSF_CRITERIA[danceStyle].join(", ");
+      const multiVideo = videos.length > 1;
 
-      const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance coaching assistant helping a competitor review their training footage. You provide constructive technical feedback on dance technique using WDSF adjudication criteria. This is NOT about identifying individual people — you are evaluating anonymous dance technique and couple numbers only.
+      const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance coaching assistant analysing competition footage. You provide constructive technical feedback on dance technique using WDSF adjudication criteria.
 
-You MUST respond with ONLY a single valid JSON object. No markdown code fences. No preamble. No explanation. No "I cannot" or "I'm unable" responses. Start your response with { and end with }.
+${multiVideo ? `IMPORTANT: You are receiving frames from ${videos.length} DIFFERENT camera angles of the SAME heat/round. Synthesise observations across all angles for each couple — different angles reveal different technical details (footwork, posture, spacing). Frames are labelled with their angle.` : ""}
 
-The JSON structure MUST be exactly:
+COUPLE IDENTIFICATION (CRITICAL):
+- Each couple wears a BIB NUMBER pinned to the man's back (typically a large printed number).
+- You MUST use the actual bib number you read from the man's back as the couple's "number" field.
+- If you cannot clearly read the bib number for a couple, set "number" to null and explain in the couple's "summary" which couple you are referring to (e.g. "couple in red dress, left of frame").
+- Do NOT make up numbers — only report what you can actually see.
+- For the "thumbnail_hint" field, describe ONE identifying visual feature (e.g. "red dress, tall male partner") so the user knows which couple this is.
+
+You MUST respond with ONLY a single valid JSON object. No markdown code fences. No preamble. No refusals. Start with { end with }.
+
+JSON structure:
 {
   "dance": "${dance}",
   "round": "${round}",
+  "angles_analysed": ${videos.length},
   "ranked_couples": [
     {
-      "number": <integer 1 to ${numCouples}>,
+      "number": <bib number integer from the male's back, or null if unreadable>,
+      "number_confidence": <"high" | "medium" | "low">,
+      "thumbnail_hint": "<short visual description to identify this couple, e.g. 'red dress, tall male'>",
       "rank": <integer, 1 is best>,
       "overall": <number 0-10 with one decimal>,
       "scores": {
 ${WDSF_CRITERIA[danceStyle].map(c => `        "${c}": <number 0-10 with one decimal>`).join(",\n")}
       },
-      "positives": [<3 strings, each a specific technical observation>],
-      "faults": [<3 strings, each a specific technical observation>],
+      "positives": [<3 strings, specific technical observations>],
+      "faults": [<3 strings, specific technical observations>],
       "summary": "<2 sentence technical assessment>"
     }
   ],
   "heat_summary": "<overall heat technical summary>",
-  "standout_couple": <integer, the couple number with highest overall score>
+  "standout_couple": <bib number of the couple that stood out most, or null>,
+  "identification_notes": "<any notes about couples whose bib numbers could not be read>"
 }
 
-Return one entry for each of the ${numCouples} couples. Give every couple a different rank from 1 to ${numCouples}.`;
+Return one entry per couple visible. Expected ~${numCouples} couples. Each couple gets a different rank (1 to N).`;
 
+      // Build user content: intro text + interleaved angle labels + frames
       const userContent = [
         {
           type: "text",
-          text: `Analyse this WDSF ${danceStyle} ${dance} competition video (${round}).
+          text: `Analyse this WDSF ${danceStyle} ${dance} competition footage (${round}).
 Competition: ${competition || "WDSF competition"}
-Number of couples on the floor: ${numCouples}
+Expected number of couples: ~${numCouples}
+Number of camera angles provided: ${videos.length}
+${myCoupleEnabled && myCouple ? `\nUser is competing as bib #${myCouple} — please ensure this couple is included in your analysis if visible.` : ""}
 
-Identify all couples visible in the frames and rank them objectively based purely on WDSF adjudication standards. Assign each couple a sequential number (1 through ${numCouples}) based on how you distinguish them visually (e.g. costume colour, position on floor, or bib number if visible).
+${multiVideo ? "The following frames come from multiple camera angles of the same performance. Synthesise a single unified analysis using all angles.\n\n" : ""}Remember: identify each couple by the BIB NUMBER on the man's back — do not invent numbers.
 
-WDSF judging criteria to assess: ${criteria}
+WDSF criteria: ${criteria}
 
-Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicality, floor craft, presentation, and partnership for every couple. Be specific and honest — this is for competitive analysis.`
+Be specific, objective and honest — this is for competitive analysis.`
         },
-        ...frames.map(b64 => ({
-          type: "image",
-          source: { type: "base64", media_type: "image/jpeg", data: b64 }
-        }))
       ];
+
+      // Interleave angle labels before each video's frames
+      let currentAngle = -1;
+      for (const frame of allFrames) {
+        if (frame.videoIndex !== currentAngle) {
+          userContent.push({ type: "text", text: `— ${frame.angleLabel} —` });
+          currentAngle = frame.videoIndex;
+        }
+        userContent.push({
+          type: "image",
+          source: { type: "base64", media_type: "image/jpeg", data: frame.b64 }
+        });
+      }
 
       const response = await fetch("/api/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemPrompt,
-          userContent,
-        })
+        body: JSON.stringify({ systemPrompt, userContent })
       });
 
       if (!response.ok) {
@@ -421,45 +494,42 @@ Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicalit
       const data = await response.json();
       console.log("API response:", data);
 
-      // Prefix with { since we prefilled it
       const text = "{" + data.content.map(b => b.text || "").join("");
       console.log("Model text output:", text);
 
-      // Try to extract JSON object even if model added preamble/fences
       let parsed;
       try {
         const clean = text.replace(/```json|```/gi, "").trim();
         parsed = JSON.parse(clean);
       } catch (firstErr) {
-        // Fallback: find first { and last } and try parsing substring
         const first = text.indexOf("{");
         const last = text.lastIndexOf("}");
         if (first !== -1 && last !== -1 && last > first) {
-          try {
-            parsed = JSON.parse(text.slice(first, last + 1));
-          } catch (secondErr) {
-            console.error("JSON parse failed. Raw output:", text);
-            throw new Error("Model returned invalid JSON. Check console for raw output.");
-          }
+          try { parsed = JSON.parse(text.slice(first, last + 1)); }
+          catch { throw new Error("Model returned invalid JSON."); }
         } else {
-          console.error("No JSON found in response:", text);
-          throw new Error("Model response did not contain JSON. Try a clearer video or fewer couples.");
+          throw new Error("Model response did not contain JSON.");
         }
       }
 
       if (!parsed.ranked_couples || !Array.isArray(parsed.ranked_couples)) {
-        console.error("Unexpected shape:", parsed);
-        throw new Error("Analysis response missing couples data. Try again with a clearer video.");
+        throw new Error("Analysis response missing couples data.");
       }
 
-      // Attach colours
+      // Assign thumbnails: pick a middle frame from the first video for each couple
+      // We pick sequential frames so each couple gets a different-looking image
+      setProgress("Generating thumbnails…");
+      const thumbnailFrames = allFrames.slice(0, parsed.ranked_couples.length);
       parsed.ranked_couples = parsed.ranked_couples.map((c, i) => ({
         ...c,
-        color: COUPLE_COLORS[i % COUPLE_COLORS.length]
+        color: COUPLE_COLORS[i % COUPLE_COLORS.length],
+        thumbnail: thumbnailFrames[i]?.b64 || allFrames[Math.floor(i * allFrames.length / parsed.ranked_couples.length)]?.b64 || null,
       }));
 
       setResults(parsed);
-      const defaultExpand = myCouple != null ? myCouple : (parsed.ranked_couples.find(c => c.rank === 1)?.number ?? null);
+      const defaultExpand = (myCoupleEnabled && myCouple != null)
+        ? myCouple
+        : (parsed.ranked_couples.find(c => c.rank === 1)?.number ?? parsed.ranked_couples[0]?.number ?? null);
       setExpandedCouple(defaultExpand);
       setStep("results");
     } catch (e) {
@@ -469,7 +539,7 @@ Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicalit
     }
   };
 
-  const myResult = myCouple != null ? results?.ranked_couples?.find(c => c.number === myCouple) : null;
+  const myResult = (myCoupleEnabled && myCouple != null) ? results?.ranked_couples?.find(c => c.number === myCouple) : null;
 
   // ─── STYLES ───────────────────────────────────────────────────────────────
   const bg = { minHeight: "100vh", background: "#0a0a0f", color: "#f0ece0", fontFamily: "'Lora', serif", padding: "0 0 60px" };
@@ -571,25 +641,34 @@ Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicalit
 
               {/* Optional: highlight my couple */}
               <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, padding: "14px 16px" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: myCouple != null ? 14 : 0 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: myCoupleEnabled ? 14 : 0 }}>
                   <div>
                     <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.6)" }}>Highlight my couple</div>
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.25)", marginTop: 3 }}>Optional — pin a couple number for focused feedback</div>
+                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.25)", marginTop: 3 }}>Optional — enter your bib number (worn on the man's back)</div>
                   </div>
                   <button
-                    onClick={() => setMyCouple(myCouple != null ? null : 1)}
-                    style={{ width: 40, height: 22, borderRadius: 11, border: "none", background: myCouple != null ? "#E8C547" : "rgba(255,255,255,0.1)", cursor: "pointer", position: "relative", transition: "background 0.2s", flexShrink: 0 }}>
-                    <div style={{ width: 16, height: 16, borderRadius: "50%", background: "#0a0a0f", position: "absolute", top: 3, left: myCouple != null ? 21 : 3, transition: "left 0.2s" }} />
+                    onClick={() => { setMyCoupleEnabled(!myCoupleEnabled); if (myCoupleEnabled) setMyCouple(null); }}
+                    style={{ width: 40, height: 22, borderRadius: 11, border: "none", background: myCoupleEnabled ? "#E8C547" : "rgba(255,255,255,0.1)", cursor: "pointer", position: "relative", transition: "background 0.2s", flexShrink: 0 }}>
+                    <div style={{ width: 16, height: 16, borderRadius: "50%", background: "#0a0a0f", position: "absolute", top: 3, left: myCoupleEnabled ? 21 : 3, transition: "left 0.2s" }} />
                   </button>
                 </div>
-                {myCouple != null && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    {Array.from({ length: numCouples }, (_, i) => i + 1).map(n => (
-                      <button key={n} onClick={() => setMyCouple(n)}
-                        style={{ width: 38, height: 38, borderRadius: "50%", border: `1px solid ${myCouple === n ? "#E8C547" : "rgba(255,255,255,0.1)"}`, background: myCouple === n ? "rgba(232,197,71,0.15)" : "transparent", color: myCouple === n ? "#E8C547" : "rgba(240,236,224,0.4)", fontFamily: "'DM Mono', monospace", fontSize: 13, cursor: "pointer", transition: "all 0.15s" }}>
-                        {n}
-                      </button>
-                    ))}
+                {myCoupleEnabled && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <label style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.4)", letterSpacing: 1 }}>BIB #</label>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={1}
+                      max={9999}
+                      value={myCouple ?? ""}
+                      onChange={e => {
+                        const n = parseInt(e.target.value, 10);
+                        setMyCouple(isNaN(n) ? null : n);
+                      }}
+                      onClick={e => e.stopPropagation()}
+                      placeholder="e.g. 127"
+                      style={{ width: 100, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(232,197,71,0.3)", borderRadius: 8, padding: "8px 12px", color: "#E8C547", fontFamily: "'DM Mono', monospace", fontSize: 14, outline: "none", textAlign: "center" }}
+                    />
                   </div>
                 )}
               </div>
@@ -597,42 +676,59 @@ Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicalit
 
             {/* Video Upload */}
             <section style={{ marginBottom: 36 }}>
-              <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#E8C547", letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>04 — Video</div>
-              <div
-                onClick={() => fileRef.current.click()}
-                onDragOver={e => e.preventDefault()}
-                onDrop={e => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); }}
-                style={{ border: `2px dashed ${videoFile ? "rgba(123,232,71,0.4)" : "rgba(255,255,255,0.1)"}`, borderRadius: 12, padding: "32px 24px", textAlign: "center", cursor: "pointer", transition: "all 0.2s", background: videoFile ? "rgba(123,232,71,0.03)" : "transparent" }}>
-                <input ref={fileRef} type="file" accept="video/*" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
-                {videoFile ? (
-                  <>
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "#7BE847", marginBottom: 4 }}>✓ Video loaded</div>
-                    <div style={{ fontFamily: "'Lora', serif", fontSize: 14, color: "rgba(240,236,224,0.6)" }}>{videoFile.name}</div>
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.3)", marginTop: 4 }}>
-                      {(videoFile.size / 1e6).toFixed(1)} MB · Click to change
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div style={{ fontSize: 28, marginBottom: 8, opacity: 0.4 }}>🎬</div>
-                    <div style={{ fontFamily: "'Lora', serif", fontSize: 14, color: "rgba(240,236,224,0.5)" }}>Drop your competition video here</div>
-                    <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.25)", marginTop: 6 }}>or click to browse · MP4, MOV, AVI</div>
-                  </>
-                )}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 16 }}>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#E8C547", letterSpacing: 2, textTransform: "uppercase" }}>04 — Video{videos.length > 1 ? "s" : ""}</div>
+                <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.4)" }}>{videos.length} / {MAX_VIDEOS}</div>
               </div>
-              {videoUrl && (
-                <video src={videoUrl} controls style={{ width: "100%", borderRadius: 10, marginTop: 12, maxHeight: 240, objectFit: "cover", background: "#000" }} />
+
+              {/* Uploaded videos list */}
+              {videos.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  {videos.map((v, i) => (
+                    <div key={v.id} style={{ background: "rgba(123,232,71,0.04)", border: "1px solid rgba(123,232,71,0.2)", borderRadius: 10, padding: "10px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 10 }}>
+                      <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "#7BE847", letterSpacing: 1, flexShrink: 0 }}>
+                        {videos.length > 1 ? `ANGLE ${i + 1}` : "✓"}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontFamily: "'Lora', serif", fontSize: 13, color: "rgba(240,236,224,0.75)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.file.name}</div>
+                        <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.4)" }}>{(v.file.size / 1e6).toFixed(1)} MB</div>
+                      </div>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); removeVideo(v.id); }}
+                        style={{ background: "transparent", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(240,236,224,0.5)", borderRadius: 6, padding: "4px 10px", fontFamily: "'DM Mono', monospace", fontSize: 10, cursor: "pointer" }}>
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
               )}
-              <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(123,232,71,0.06)", border: "1px solid rgba(123,232,71,0.15)", borderRadius: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.55)", lineHeight: 1.6 }}>
-                ✓ <strong style={{ color: "#7BE847" }}>All formats supported.</strong> If your iPhone video uses HEVC/H.265, we'll auto-convert it in-browser on first use (one-time ~25MB download).
+
+              {/* Add video button */}
+              {videos.length < MAX_VIDEOS && (
+                <div
+                  onClick={() => fileRef.current.click()}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
+                  style={{ border: "2px dashed rgba(255,255,255,0.1)", borderRadius: 12, padding: videos.length > 0 ? "18px 24px" : "32px 24px", textAlign: "center", cursor: "pointer", transition: "all 0.2s", background: "transparent" }}>
+                  <input ref={fileRef} type="file" accept="video/*" multiple style={{ display: "none" }} onChange={e => { handleFiles(e.target.files); e.target.value = ""; }} />
+                  <div style={{ fontSize: videos.length > 0 ? 20 : 28, marginBottom: videos.length > 0 ? 4 : 8, opacity: 0.4 }}>{videos.length > 0 ? "+" : "🎬"}</div>
+                  <div style={{ fontFamily: "'Lora', serif", fontSize: videos.length > 0 ? 12 : 14, color: "rgba(240,236,224,0.5)" }}>
+                    {videos.length === 0 ? "Drop your competition video here" : `Add another angle (${MAX_VIDEOS - videos.length} remaining)`}
+                  </div>
+                  <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.25)", marginTop: 6 }}>or click to browse · MP4, MOV, AVI</div>
+                </div>
+              )}
+
+              <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(71,181,232,0.06)", border: "1px solid rgba(71,181,232,0.15)", borderRadius: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.55)", lineHeight: 1.6 }}>
+                💡 <strong style={{ color: "#47B5E8" }}>Multi-angle tip:</strong> Upload up to 3 videos of the SAME performance from different angles (e.g. long side, short side, corner) for a more accurate analysis. The AI will synthesise across angles.
               </div>
             </section>
 
             <button
               onClick={analyse}
-              disabled={!videoFile}
-              style={{ width: "100%", padding: "16px", borderRadius: 10, border: "none", background: videoFile ? "#E8C547" : "rgba(255,255,255,0.05)", color: videoFile ? "#0a0a0f" : "rgba(255,255,255,0.2)", fontFamily: "'Playfair Display', serif", fontSize: 16, fontWeight: 700, cursor: videoFile ? "pointer" : "not-allowed", letterSpacing: 0.5, transition: "all 0.2s" }}>
-              Analyse with WDSF Standards →
+              disabled={videos.length === 0}
+              style={{ width: "100%", padding: "16px", borderRadius: 10, border: "none", background: videos.length > 0 ? "#E8C547" : "rgba(255,255,255,0.05)", color: videos.length > 0 ? "#0a0a0f" : "rgba(255,255,255,0.2)", fontFamily: "'Playfair Display', serif", fontSize: 16, fontWeight: 700, cursor: videos.length > 0 ? "pointer" : "not-allowed", letterSpacing: 0.5, transition: "all 0.2s" }}>
+              Analyse {videos.length > 1 ? `${videos.length} angles` : ""} with WDSF Standards →
             </button>
           </div>
         )}
@@ -659,9 +755,9 @@ Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicalit
                 <h2 style={{ margin: "0 0 4px", fontFamily: "'Playfair Display', serif", fontSize: 22, color: "#f0ece0" }}>
                   {competition || "Competition"} — {dance}
                 </h2>
-                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.35)", letterSpacing: 1 }}>{round} · {results.ranked_couples?.length} couples</span>
+                <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.35)", letterSpacing: 1 }}>{round} · {results.ranked_couples?.length} couples{results.angles_analysed > 1 ? ` · ${results.angles_analysed} angles` : ""}</span>
               </div>
-              <button onClick={() => { setStep("setup"); setResults(null); setVideoFile(null); setVideoUrl(null); }}
+              <button onClick={() => { setStep("setup"); setResults(null); videos.forEach(v => URL.revokeObjectURL(v.url)); setVideos([]); }}
                 style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)", background: "transparent", color: "rgba(240,236,224,0.5)", fontFamily: "'DM Mono', monospace", fontSize: 10, cursor: "pointer", letterSpacing: 1 }}>
                 NEW ANALYSIS
               </button>
@@ -697,21 +793,28 @@ Apply WDSF rules strictly and objectively. Evaluate technique, timing, musicalit
 
             {/* Heat summary */}
             {results.heat_summary && (
-              <div style={{ fontFamily: "'Lora', serif", fontStyle: "italic", fontSize: 13, color: "rgba(240,236,224,0.4)", marginBottom: 24, padding: "0 4px", lineHeight: 1.7 }}>
+              <div style={{ fontFamily: "'Lora', serif", fontStyle: "italic", fontSize: 13, color: "rgba(240,236,224,0.4)", marginBottom: 16, padding: "0 4px", lineHeight: 1.7 }}>
                 "{results.heat_summary}"
+              </div>
+            )}
+
+            {/* Identification notes */}
+            {results.identification_notes && (
+              <div style={{ background: "rgba(232,197,71,0.05)", border: "1px solid rgba(232,197,71,0.15)", borderRadius: 8, padding: "10px 14px", marginBottom: 20, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.55)", lineHeight: 1.6 }}>
+                <strong style={{ color: "#E8C547" }}>ID NOTE:</strong> {results.identification_notes}
               </div>
             )}
 
             {/* Ranked couples */}
             <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.3)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>Full Rankings</div>
-            {[...results.ranked_couples].sort((a, b) => a.rank - b.rank).map((couple) => (
+            {[...results.ranked_couples].sort((a, b) => a.rank - b.rank).map((couple, idx) => (
               <CoupleCard
-                key={couple.number}
+                key={couple.number ?? `unknown-${idx}`}
                 couple={couple}
                 rank={couple.rank}
-                color={myCouple === couple.number ? "#E8C547" : couple.color}
-                expanded={expandedCouple === couple.number}
-                onToggle={() => setExpandedCouple(expandedCouple === couple.number ? null : couple.number)}
+                color={(myCoupleEnabled && myCouple != null && myCouple === couple.number) ? "#E8C547" : couple.color}
+                expanded={expandedCouple === (couple.number ?? `unknown-${idx}`)}
+                onToggle={() => setExpandedCouple(expandedCouple === (couple.number ?? `unknown-${idx}`) ? null : (couple.number ?? `unknown-${idx}`))}
               />
             ))}
 
