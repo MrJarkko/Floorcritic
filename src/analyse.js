@@ -1,23 +1,26 @@
 // Vercel serverless function — /api/analyse
-// Proxies the Anthropic API call so the API key stays on the server.
-// Set ANTHROPIC_API_KEY as an environment variable in Vercel project settings.
+// Uses Gemini 2.5 Pro for native video understanding (including audio/music).
+// Set GEMINI_API_KEY as an environment variable in Vercel project settings.
+
+import { GoogleGenAI } from "@google/genai";
 
 export const config = {
-  maxDuration: 60, // Vercel Hobby tier max. If you upgrade to Pro, bump to 300. For 24+ frames you may need this.
+  maxDuration: 300, // 5min — video analysis takes 30-90s; needs Vercel Pro. Hobby caps at 60s.
+  api: {
+    bodyParser: {
+      sizeLimit: "100mb", // video uploads
+    },
+  },
 };
 
-// ─── Simple in-memory rate limiting ───
-// For serious production use, replace this with Upstash Redis or Vercel KV.
-// Limits: 5 analyses per IP per hour, 50 per day globally.
-const ipBuckets = new Map(); // ip → { count, resetAt }
+// ─── Rate limiting ───
+const ipBuckets = new Map();
 const GLOBAL_LIMIT = { count: 0, resetAt: Date.now() + 24 * 3600_000, max: 50 };
-const IP_WINDOW_MS = 3600_000; // 1 hour
+const IP_WINDOW_MS = 3600_000;
 const IP_MAX = 5;
 
 function checkRateLimit(ip) {
   const now = Date.now();
-
-  // Global daily cap (protects your wallet)
   if (now > GLOBAL_LIMIT.resetAt) {
     GLOBAL_LIMIT.count = 0;
     GLOBAL_LIMIT.resetAt = now + 24 * 3600_000;
@@ -25,8 +28,6 @@ function checkRateLimit(ip) {
   if (GLOBAL_LIMIT.count >= GLOBAL_LIMIT.max) {
     return { ok: false, reason: "Daily capacity reached — try again tomorrow." };
   }
-
-  // Per-IP hourly cap
   const bucket = ipBuckets.get(ip);
   if (!bucket || now > bucket.resetAt) {
     ipBuckets.set(ip, { count: 1, resetAt: now + IP_WINDOW_MS });
@@ -37,7 +38,6 @@ function checkRateLimit(ip) {
     }
     bucket.count++;
   }
-
   GLOBAL_LIMIT.count++;
   return { ok: true };
 }
@@ -48,13 +48,12 @@ export default async function handler(req, res) {
     return;
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    res.status(500).json({ error: "Server not configured (missing ANTHROPIC_API_KEY)" });
+    res.status(500).json({ error: "Server not configured (missing GEMINI_API_KEY)" });
     return;
   }
 
-  // Rate limit check
   const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.headers["x-real-ip"] || "unknown";
   const rl = checkRateLimit(ip);
   if (!rl.ok) {
@@ -62,42 +61,60 @@ export default async function handler(req, res) {
     return;
   }
 
-  const { systemPrompt, userContent } = req.body || {};
-  if (!systemPrompt || !userContent) {
-    res.status(400).json({ error: "Missing systemPrompt or userContent" });
+  const { systemPrompt, userPrompt, videos } = req.body || {};
+  if (!systemPrompt || !userPrompt || !Array.isArray(videos) || videos.length === 0) {
+    res.status(400).json({ error: "Missing systemPrompt, userPrompt, or videos array" });
     return;
   }
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-opus-4-5",
-        max_tokens: 4000,
-        system: systemPrompt,
-        messages: [
-          { role: "user", content: userContent },
-          { role: "assistant", content: "{" },
-        ],
-      }),
-    });
+    const ai = new GoogleGenAI({ apiKey });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("Anthropic API error:", response.status, errText);
-      res.status(response.status).json({ error: `Anthropic API ${response.status}: ${errText.slice(0, 300)}` });
-      return;
+    const parts = [{ text: userPrompt }];
+
+    for (let i = 0; i < videos.length; i++) {
+      const v = videos[i];
+      if (!v.data || !v.mimeType) {
+        res.status(400).json({ error: `Video ${i + 1} missing data or mimeType` });
+        return;
+      }
+      parts.push({ text: `\n═══ ${videos.length > 1 ? `ANGLE ${i + 1}` : "MAIN VIEW"} ═══` });
+      parts.push({
+        inlineData: { mimeType: v.mimeType, data: v.data },
+      });
     }
 
-    const data = await response.json();
-    res.status(200).json(data);
+    console.log(`Gemini request: ${videos.length} video(s)`);
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-pro",
+      contents: [{ role: "user", parts }],
+      config: {
+        systemInstruction: systemPrompt,
+        temperature: 0.3,
+        maxOutputTokens: 8000,
+        responseMimeType: "application/json",
+      },
+    });
+
+    const text = response.text;
+    if (!text) {
+      console.error("Empty Gemini response:", response);
+      res.status(500).json({ error: "Gemini returned empty response" });
+      return;
+    }
+    console.log("Gemini response length:", text.length);
+
+    res.status(200).json({ text });
   } catch (e) {
-    console.error("Proxy error:", e);
-    res.status(500).json({ error: e.message || "Unknown server error" });
+    console.error("Gemini API error:", e);
+    const msg = e.message || "Unknown server error";
+    if (msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED")) {
+      res.status(429).json({ error: "Gemini quota exceeded. Check your Google AI Studio billing." });
+    } else if (msg.includes("SAFETY") || msg.includes("blocked")) {
+      res.status(400).json({ error: "Video was blocked by safety filters. Try a different clip." });
+    } else {
+      res.status(500).json({ error: `Gemini: ${msg.slice(0, 300)}` });
+    }
   }
 }

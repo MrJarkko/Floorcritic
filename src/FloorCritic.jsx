@@ -402,134 +402,170 @@ export default function FloorCritic() {
     });
   }, []);
 
+  // ─── Helper: read file as base64 ───
+  const fileToBase64 = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]); // strip data:video/...;base64,
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+
+  // ─── Helper: transcode HEVC to H.264 via ffmpeg.wasm if needed ───
+  const transcodeIfNeeded = useCallback(async (file) => {
+    // Check if browser can play it natively — if not, likely HEVC
+    const canPlay = await new Promise(resolve => {
+      const v = document.createElement("video");
+      v.muted = true;
+      v.preload = "metadata";
+      v.onloadedmetadata = () => resolve(!!(v.videoWidth && v.videoHeight));
+      v.onerror = () => resolve(false);
+      v.src = URL.createObjectURL(file);
+      setTimeout(() => resolve(false), 5000); // fallback timeout
+    });
+
+    if (canPlay) return { file, mimeType: file.type || "video/mp4" };
+
+    console.log("Video appears to be HEVC/unsupported — transcoding to H.264");
+    setProgress("Converting video format (HEVC → H.264)…");
+    const { ffmpeg, fetchFile } = await loadFFmpeg();
+    const inputName = "input" + (file.name.match(/\.[a-z0-9]+$/i)?.[0] || ".mov");
+    const outputName = "output.mp4";
+    await ffmpeg.writeFile(inputName, await fetchFile(file));
+    await ffmpeg.exec([
+      "-i", inputName,
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "28",
+      "-c:a", "aac",
+      "-b:a", "96k",
+      "-movflags", "+faststart",
+      outputName,
+    ]);
+    const data = await ffmpeg.readFile(outputName);
+    const blob = new Blob([data.buffer], { type: "video/mp4" });
+    const newFile = new File([blob], file.name.replace(/\.[^.]+$/, ".mp4"), { type: "video/mp4" });
+    await ffmpeg.deleteFile(inputName);
+    await ffmpeg.deleteFile(outputName);
+    return { file: newFile, mimeType: "video/mp4" };
+  }, [loadFFmpeg]);
+
+  // ─── Extract 1 thumbnail from video for UI display (local-only) ───
+  const extractThumbnail = useCallback(async (file) => {
+    try {
+      const frames = await extractFrames(file, 1);
+      return frames?.[0]?.b64 || null;
+    } catch {
+      try {
+        const frames = await extractFramesFFmpeg(file, 1);
+        return frames?.[0]?.b64 || null;
+      } catch {
+        return null;
+      }
+    }
+  }, [extractFrames, extractFramesFFmpeg]);
+
   const analyse = async () => {
     if (videos.length === 0) return;
     setStep("analysing");
     setError(null);
 
     try {
-      // Extract frames from every uploaded video
-      const allFrames = []; // { videoIndex, angleLabel, b64 }
-      // More frames = better temporal coverage for musicality analysis
-      // 20 frames per video gives ~1 frame per 3s on a 60s video - enough to see beat patterns
-      const framesPerVideo = videos.length === 1 ? 24 : videos.length === 2 ? 16 : 12;
-
+      // Step 1: Transcode any HEVC videos to H.264 so Gemini accepts them cleanly
+      setProgress("Preparing videos…");
+      const preparedVideos = [];
       for (let i = 0; i < videos.length; i++) {
-        const v = videos[i];
-        const angleLabel = videos.length === 1 ? "Main view" : `Angle ${i + 1}`;
-        setProgress(`Extracting frames from video ${i + 1} of ${videos.length}…`);
-
-        let frames = [];
-        try {
-          frames = await extractFrames(v.file, framesPerVideo);
-        } catch (nativeErr) {
-          const msg = nativeErr.message.toLowerCase();
-          const isCodecIssue = msg.includes("hevc") || msg.includes("h.265") || msg.includes("codec") || msg.includes("could not be loaded") || msg.includes("dimensions");
-          if (isCodecIssue) {
-            setProgress(`Converting video ${i + 1} (HEVC → JPEG)…`);
-            frames = await extractFramesFFmpeg(v.file, framesPerVideo);
-          } else {
-            throw nativeErr;
-          }
-        }
-
-        if (!frames || frames.length === 0) {
-          throw new Error(`No frames extracted from video ${i + 1}. Check format.`);
-        }
-        frames.forEach(f => allFrames.push({ videoIndex: i, angleLabel, b64: f.b64, t: f.t }));
+        setProgress(`Preparing video ${i + 1} of ${videos.length}…`);
+        const { file, mimeType } = await transcodeIfNeeded(videos[i].file);
+        preparedVideos.push({ file, mimeType, originalId: videos[i].id });
       }
 
-      console.log(`Total frames extracted: ${allFrames.length} across ${videos.length} video(s)`);
-      setProgress(`Sending ${allFrames.length} frames to AI for WDSF analysis…`);
+      // Step 2: Extract 1 thumbnail from each video for UI
+      setProgress("Generating thumbnails…");
+      const thumbnails = [];
+      for (const pv of preparedVideos) {
+        const thumb = await extractThumbnail(pv.file);
+        thumbnails.push(thumb);
+      }
 
+      // Step 3: Encode each video as base64 for API upload
+      setProgress("Encoding videos for upload…");
+      const videoPayload = [];
+      for (let i = 0; i < preparedVideos.length; i++) {
+        setProgress(`Encoding video ${i + 1} of ${preparedVideos.length}…`);
+        const data = await fileToBase64(preparedVideos[i].file);
+        videoPayload.push({ mimeType: preparedVideos[i].mimeType, data });
+      }
+
+      const totalMB = videoPayload.reduce((s, v) => s + v.data.length, 0) * 0.75 / 1024 / 1024;
+      console.log(`Total upload size: ${totalMB.toFixed(1)} MB`);
+      if (totalMB > 90) {
+        throw new Error(`Total video size ${totalMB.toFixed(0)}MB exceeds 90MB limit. Trim videos or reduce resolution.`);
+      }
+
+      // Step 4: Build prompts
       const criteria = WDSF_CRITERIA[danceStyle].join(", ");
       const multiVideo = videos.length > 1;
 
-      const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance coaching assistant analysing competition footage. You provide constructive technical feedback on dance technique using WDSF adjudication criteria.
+      const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance adjudicator analysing competition video footage. You have 20+ years of international judging experience. You provide specific, constructive technical feedback using official WDSF adjudication criteria.
 
-${multiVideo ? `IMPORTANT: You are receiving frames from ${videos.length} DIFFERENT camera angles of the SAME heat/round. Synthesise observations across all angles for each couple — different angles reveal different technical details (footwork, posture, spacing). Frames are labelled with their angle.` : ""}
+${multiVideo ? `IMPORTANT: You are receiving ${videos.length} DIFFERENT camera angles of the SAME heat. Synthesise observations across all angles for each couple — different angles reveal different technical details.` : ""}
 
-TEMPORAL ANALYSIS — CRITICAL:
-- You are receiving ${framesPerVideo} frames per video, extracted at evenly-spaced moments throughout the dance.
-- Analyse the PROGRESSION across frames: how body positions, footwork, shapes, and spacing evolve over time.
-- For TIMING & MUSICALITY: look at how couples move BETWEEN frames. ${dance === "Waltz" || dance === "Viennese Waltz" ? "For waltz, check the 1-2-3 timing pattern and rise-and-fall flow between frames." : dance === "Tango" ? "For tango, check staccato accents and held positions." : dance === "Quickstep" ? "For quickstep, check the rhythmic pattern (slow-quick-quick) and lightness between frames." : dance === "Cha Cha" ? "For cha cha, check the cha-cha-cha split-beat timing visible in leg positions between frames." : dance === "Samba" ? "For samba, check the bounce action and pendulum movement evolution." : dance === "Rumba" ? "For rumba, check the 2-3-4-1 timing with slow hip action between frames." : "Check how movement aligns with the typical rhythm of this dance."}
-- For FLOOR CRAFT: compare spacing and position changes across frames to spot collisions or good navigation.
-- For PRESENTATION: assess consistency across the entire performance, not just isolated moments.
-- Explicitly note if a couple appears OFF TIME or OUT OF SYNC based on positions between frames.
+ANALYSIS APPROACH:
+- You can see the FULL video with audio. Watch how couples move to the music, not just their shapes.
+- For TIMING & MUSICALITY: listen to the beat and observe whether couples' steps land on the correct counts. ${dance === "Waltz" || dance === "Viennese Waltz" ? "Waltz: verify the 1-2-3 pattern with proper rise-and-fall." : dance === "Tango" ? "Tango: staccato accents on beats, held body positions." : dance === "Quickstep" ? "Quickstep: SQQ or SS timing, lightness on quicks." : dance === "Foxtrot" ? "Foxtrot: SQQ timing with smooth long steps." : dance === "Cha Cha" ? "Cha cha: 2-3-4&1 split-beat timing, hip action on 1." : dance === "Samba" ? "Samba: bounce action, 1a2 rhythm, hip roll on a." : dance === "Rumba" ? "Rumba: slow 2-3-4-1, hip settles on the &." : dance === "Paso Doble" ? "Paso Doble: march-like 1-2 timing, strong body shapes." : dance === "Jive" ? "Jive: QQS-QQS with chick-chicken triple steps and kick-ball-change." : `Check ${dance}-specific rhythm patterns.`}
+- For FLOOR CRAFT: watch navigation and near-collisions across the whole floor.
+- For TECHNIQUE: evaluate posture, footwork, frame (Standard) or hip action, leg action (Latin).
+- For PRESENTATION: assess performance quality, confidence, expression throughout.
+- For PARTNERSHIP: synchronisation, connection, lead-follow clarity.
 
 COUPLE IDENTIFICATION (CRITICAL):
-- Each couple wears a BIB NUMBER pinned to the man's back (typically a large printed number).
-- You MUST use the actual bib number you read from the man's back as the couple's "number" field.
-- If you cannot clearly read the bib number for a couple, set "number" to null and explain in the couple's "summary" which couple you are referring to (e.g. "couple in red dress, left of frame").
-- Do NOT make up numbers — only report what you can actually see.
-- For the "thumbnail_hint" field, describe ONE identifying visual feature (e.g. "red dress, tall male partner") so the user knows which couple this is.
+- Each couple wears a BIB NUMBER pinned to the man's back (large printed number).
+- You MUST use the actual bib number you read as the couple's "number" field.
+- If you cannot clearly read a bib number, set "number" to null and describe the couple in "thumbnail_hint" (e.g. "red dress, tall male partner").
+- NEVER invent bib numbers.
 
-You MUST respond with ONLY a single valid JSON object. No markdown code fences. No preamble. No refusals. Start with { end with }.
-
-JSON structure:
+Respond ONLY with a valid JSON object matching this schema exactly:
 {
   "dance": "${dance}",
   "round": "${round}",
   "angles_analysed": ${videos.length},
-  "frames_analysed": ${videos.length * framesPerVideo},
   "ranked_couples": [
     {
-      "number": <bib number integer from the male's back, or null if unreadable>,
+      "number": <bib number integer or null>,
       "number_confidence": <"high" | "medium" | "low">,
-      "thumbnail_hint": "<short visual description to identify this couple, e.g. 'red dress, tall male'>",
+      "thumbnail_hint": "<short visual description>",
       "rank": <integer, 1 is best>,
-      "overall": <number 0-10 with one decimal>,
+      "overall": <number 0-10, one decimal>,
       "scores": {
-${WDSF_CRITERIA[danceStyle].map(c => `        "${c}": <number 0-10 with one decimal>`).join(",\n")}
+${WDSF_CRITERIA[danceStyle].map(c => `        "${c}": <number 0-10, one decimal>`).join(",\n")}
       },
-      "positives": [<3 strings, specific technical observations>],
-      "faults": [<3 strings, specific technical observations>],
-      "summary": "<2 sentence technical assessment>"
+      "positives": [<3-5 specific observations>],
+      "faults": [<3-5 specific observations>],
+      "summary": "<2-3 sentence technical assessment>"
     }
   ],
-  "heat_summary": "<overall heat technical summary>",
-  "standout_couple": <bib number of the couple that stood out most, or null>,
-  "identification_notes": "<any notes about couples whose bib numbers could not be read>"
+  "heat_summary": "<overall heat assessment>",
+  "standout_couple": <bib number of top couple or null>,
+  "identification_notes": "<notes about unreadable bib numbers>"
 }
 
-Return one entry per couple visible. Expected ~${numCouples} couples. Each couple gets a different rank (1 to N).`;
+Return one entry per couple visible. Expected ~${numCouples} couples. Each gets a unique rank from 1 to N.`;
 
-      // Build user content: intro text + interleaved angle labels + frames
-      const userContent = [
-        {
-          type: "text",
-          text: `Analyse this WDSF ${danceStyle} ${dance} competition footage (${round}).
+      const userPrompt = `Analyse this WDSF ${danceStyle} ${dance} competition footage (${round}).
 Competition: ${competition || "WDSF competition"}
-Expected number of couples: ~${numCouples}
-Number of camera angles provided: ${videos.length}
-${myCoupleEnabled && myCouple ? `\nUser is competing as bib #${myCouple} — please ensure this couple is included in your analysis if visible.` : ""}
-
-${multiVideo ? "The following frames come from multiple camera angles of the same performance. Synthesise a single unified analysis using all angles.\n\n" : ""}Remember: identify each couple by the BIB NUMBER on the man's back — do not invent numbers.
+Expected couples: ~${numCouples}
+Angles provided: ${videos.length}${myCoupleEnabled && myCouple ? `\nUser's bib number: #${myCouple} — include this couple in your analysis if visible.` : ""}
 
 WDSF criteria: ${criteria}
 
-Be specific, objective and honest — this is for competitive analysis.`
-        },
-      ];
+Be specific, objective, and honest. The user is a competitor seeking to improve.`;
 
-      // Interleave angle labels + per-frame timestamps before each image
-      let currentAngle = -1;
-      for (const frame of allFrames) {
-        if (frame.videoIndex !== currentAngle) {
-          userContent.push({ type: "text", text: `\n═══ ${frame.angleLabel} ═══` });
-          currentAngle = frame.videoIndex;
-        }
-        userContent.push({ type: "text", text: `[t = ${frame.t.toFixed(1)}s]` });
-        userContent.push({
-          type: "image",
-          source: { type: "base64", media_type: "image/jpeg", data: frame.b64 }
-        });
-      }
+      setProgress("Sending to Gemini for WDSF analysis… (this may take 30-90s)");
 
       const response = await fetch("/api/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ systemPrompt, userContent })
+        body: JSON.stringify({ systemPrompt, userPrompt, videos: videoPayload })
       });
 
       if (!response.ok) {
@@ -541,27 +577,22 @@ Be specific, objective and honest — this is for competitive analysis.`
           const errText = await response.text();
           errMsg = `API ${response.status}: ${errText.slice(0, 200)}`;
         }
-        console.error("API error:", errMsg);
         throw new Error(errMsg);
       }
-      const data = await response.json();
-      console.log("API response:", data);
 
-      const text = "{" + data.content.map(b => b.text || "").join("");
-      console.log("Model text output:", text);
+      const { text } = await response.json();
+      console.log("Gemini response:", text);
 
       let parsed;
       try {
-        const clean = text.replace(/```json|```/gi, "").trim();
-        parsed = JSON.parse(clean);
-      } catch (firstErr) {
+        parsed = JSON.parse(text);
+      } catch {
         const first = text.indexOf("{");
         const last = text.lastIndexOf("}");
         if (first !== -1 && last !== -1 && last > first) {
-          try { parsed = JSON.parse(text.slice(first, last + 1)); }
-          catch { throw new Error("Model returned invalid JSON."); }
+          parsed = JSON.parse(text.slice(first, last + 1));
         } else {
-          throw new Error("Model response did not contain JSON.");
+          throw new Error("Model returned invalid JSON. See console.");
         }
       }
 
@@ -569,14 +600,11 @@ Be specific, objective and honest — this is for competitive analysis.`
         throw new Error("Analysis response missing couples data.");
       }
 
-      // Assign thumbnails: pick a middle frame from the first video for each couple
-      // We pick sequential frames so each couple gets a different-looking image
-      setProgress("Generating thumbnails…");
-      const thumbnailFrames = allFrames.slice(0, parsed.ranked_couples.length);
+      // Attach colours and thumbnails (cycle through extracted thumbnails)
       parsed.ranked_couples = parsed.ranked_couples.map((c, i) => ({
         ...c,
         color: COUPLE_COLORS[i % COUPLE_COLORS.length],
-        thumbnail: thumbnailFrames[i]?.b64 || allFrames[Math.floor(i * allFrames.length / parsed.ranked_couples.length)]?.b64 || null,
+        thumbnail: thumbnails[i % thumbnails.length] || null,
       }));
 
       setResults(parsed);
@@ -774,7 +802,7 @@ Be specific, objective and honest — this is for competitive analysis.`
               )}
 
               <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(71,181,232,0.06)", border: "1px solid rgba(71,181,232,0.15)", borderRadius: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.55)", lineHeight: 1.6 }}>
-                💡 <strong style={{ color: "#47B5E8" }}>Multi-angle tip:</strong> Upload up to 3 videos of the SAME performance from different angles (e.g. long side, short side, corner) for a more accurate analysis. The AI will synthesise across angles.
+                💡 <strong style={{ color: "#47B5E8" }}>Full video analysis:</strong> Unlike frame-based tools, FloorCritic analyses the complete video including audio so it can evaluate musicality and timing. Upload up to 3 angles of the same performance for best results. Max 90MB total.
               </div>
             </section>
 
