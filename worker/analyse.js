@@ -6,7 +6,7 @@
 // the Gemini REST API — no Node SDK, Workers-native.
 
 const GEMINI = "https://generativelanguage.googleapis.com";
-const MODEL = "gemini-2.5-pro";
+const MODEL = "gemini-3.1-pro-preview";
 
 // Best-effort in-memory rate limit (advisory only — see note in upload.js).
 const ipBuckets = new Map();
