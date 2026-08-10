@@ -1,0 +1,5 @@
+# Cloudflare Pages configuration.
+# Static assets are built by Vite into dist/; serverless code lives in functions/.
+name = "floorcritic"
+compatibility_date = "2024-11-06"
+pages_build_output_dir = "dist"

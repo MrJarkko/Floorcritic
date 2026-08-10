@@ -402,13 +402,32 @@ export default function FloorCritic() {
     });
   }, []);
 
-  // ─── Helper: read file as base64 ───
-  const fileToBase64 = (file) => new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(",")[1]); // strip data:video/...;base64,
-    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
-    reader.readAsDataURL(file);
-  });
+  // ─── Upload one video to Gemini (via our /api/upload Worker) ───
+  // Bytes stream browser → Worker → Gemini Files API. We get back a tiny
+  // reference ({name, uri, mimeType, state}) — the video itself never rides
+  // inside a JSON body, so request-size limits no longer apply.
+  const uploadFileToGemini = async (file, mimeType) => {
+    console.log("[uploadFileToGemini] uploading", file.name, (file.size / 1e6).toFixed(1), "MB", mimeType);
+    const res = await fetch("/api/upload", {
+      method: "POST",
+      headers: {
+        "x-goog-upload-header-content-type": mimeType,
+        "x-goog-upload-header-content-length": String(file.size),
+        "x-display-name": file.name,
+      },
+      body: file, // raw bytes, streamed — no base64
+    });
+    if (!res.ok) {
+      const raw = await res.text();
+      let msg = `Upload failed (${res.status})`;
+      try { const j = JSON.parse(raw); if (j.error) msg = j.error; } catch { msg = `Upload ${res.status}: ${raw.slice(0, 200)}`; }
+      console.error("[uploadFileToGemini] failed:", msg);
+      throw new Error(msg);
+    }
+    const f = await res.json();
+    console.log("[uploadFileToGemini] uploaded →", f.name, f.state);
+    return f; // { name, uri, mimeType, state }
+  };
 
   // ─── Helper: transcode HEVC to H.264 via ffmpeg.wasm if needed ───
   const transcodeIfNeeded = useCallback(async (file) => {
@@ -465,21 +484,25 @@ export default function FloorCritic() {
   }, [extractFrames, extractFramesFFmpeg]);
 
   const analyse = async () => {
+    console.log("[analyse] START — videos:", videos.length, videos.map(v => ({ name: v.file.name, sizeMB: (v.file.size / 1e6).toFixed(1), type: v.file.type })));
     if (videos.length === 0) return;
     setStep("analysing");
     setError(null);
 
     try {
       // Step 1: Transcode any HEVC videos to H.264 so Gemini accepts them cleanly
+      console.log("[analyse] Step 1: transcodeIfNeeded");
       setProgress("Preparing videos…");
       const preparedVideos = [];
       for (let i = 0; i < videos.length; i++) {
         setProgress(`Preparing video ${i + 1} of ${videos.length}…`);
         const { file, mimeType } = await transcodeIfNeeded(videos[i].file);
+        console.log(`[analyse] prepared video ${i + 1}:`, file.name, (file.size / 1e6).toFixed(1), "MB", mimeType);
         preparedVideos.push({ file, mimeType, originalId: videos[i].id });
       }
 
       // Step 2: Extract 1 thumbnail from each video for UI
+      console.log("[analyse] Step 2: extractThumbnail");
       setProgress("Generating thumbnails…");
       const thumbnails = [];
       for (const pv of preparedVideos) {
@@ -487,20 +510,20 @@ export default function FloorCritic() {
         thumbnails.push(thumb);
       }
 
-      // Step 3: Encode each video as base64 for API upload
-      setProgress("Encoding videos for upload…");
-      const videoPayload = [];
-      for (let i = 0; i < preparedVideos.length; i++) {
-        setProgress(`Encoding video ${i + 1} of ${preparedVideos.length}…`);
-        const data = await fileToBase64(preparedVideos[i].file);
-        videoPayload.push({ mimeType: preparedVideos[i].mimeType, data });
-      }
-
-      const totalMB = videoPayload.reduce((s, v) => s + v.data.length, 0) * 0.75 / 1024 / 1024;
-      console.log(`Total upload size: ${totalMB.toFixed(1)} MB`);
+      // Step 3: Upload each video directly to Gemini (streamed via our Worker),
+      // collecting the lightweight file references we'll pass to /api/analyse.
+      const totalMB = preparedVideos.reduce((s, pv) => s + pv.file.size, 0) / 1024 / 1024;
+      console.log(`[analyse] Step 3: uploading ${preparedVideos.length} video(s), ${totalMB.toFixed(1)} MB total`);
       if (totalMB > 90) {
         throw new Error(`Total video size ${totalMB.toFixed(0)}MB exceeds 90MB limit. Trim videos or reduce resolution.`);
       }
+      const files = [];
+      for (let i = 0; i < preparedVideos.length; i++) {
+        setProgress(`Uploading video ${i + 1} of ${preparedVideos.length}…`);
+        const uploaded = await uploadFileToGemini(preparedVideos[i].file, preparedVideos[i].mimeType);
+        files.push({ name: uploaded.name, mimeType: uploaded.mimeType });
+      }
+      console.log("[analyse] all uploads done, file refs:", files.map(f => f.name));
 
       // Step 4: Build prompts
       const criteria = WDSF_CRITERIA[danceStyle].join(", ");
@@ -562,21 +585,29 @@ Be specific, objective, and honest. The user is a competitor seeking to improve.
 
       setProgress("Sending to Gemini for WDSF analysis… (this may take 30-90s)");
 
+      console.log(`[analyse] Step 4: POST /api/analyse with ${files.length} file ref(s) (tiny JSON — no video bytes)`);
+
       const response = await fetch("/api/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ systemPrompt, userPrompt, videos: videoPayload })
+        body: JSON.stringify({ systemPrompt, userPrompt, files })
       });
 
+      console.log(`[analyse] response: ${response.status} ${response.statusText}, content-type: ${response.headers.get("content-type")}`);
+
       if (!response.ok) {
+        // Read the body ONCE as text, then try to parse as JSON.
+        // (Reading it twice — .json() then .text() — throws "Body is disturbed or locked",
+        //  which is the misleading error users were actually seeing.)
+        const raw = await response.text();
         let errMsg = `API ${response.status}`;
         try {
-          const errJson = await response.json();
+          const errJson = JSON.parse(raw);
           if (errJson.error) errMsg = errJson.error;
         } catch {
-          const errText = await response.text();
-          errMsg = `API ${response.status}: ${errText.slice(0, 200)}`;
+          errMsg = `API ${response.status}: ${raw.slice(0, 200)}`;
         }
+        console.error("[analyse] request failed:", errMsg, "| raw body:", raw.slice(0, 300));
         throw new Error(errMsg);
       }
 
