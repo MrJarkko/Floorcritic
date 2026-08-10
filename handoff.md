@@ -25,12 +25,16 @@ Browser (React, static assets served by the Worker)
   │
   │  ffmpeg.wasm transcodes HEVC → H.264 locally if needed
   │
-  ├─→ POST /api/upload         → Worker (worker/upload.js)
-  │     raw video bytes           ├─→ starts a Gemini resumable upload session
-  │     (streamed, NOT base64)    ├─→ streams body straight through (FixedLengthStream,
-  │                               │    never buffered in Worker memory)
-  │     ←── { name, uri,          └─→ Gemini Files API stores the video
-  │           mimeType, state }
+  ├─→ POST /api/upload-url     → Worker (worker/upload-url.js)
+  │     {displayName,mime,size}   └─→ opens a Gemini resumable upload session
+  │     ←── { uploadUrl, granularity }
+  │
+  ├─→ POST /api/upload-chunk   → Worker (worker/upload-chunk.js)  [xN, 16MB each]
+  │     one 16MB slice            ├─→ validates the URL host (SSRF guard)
+  │     + offset + command        ├─→ streams the slice through (FixedLengthStream)
+  │     ←── {} then, on the       └─→ Gemini assembles the file at the given offset
+  │         final chunk,
+  │         { name, uri, mimeType, state }
   │
   └─→ POST /api/analyse        → Worker (worker/analyse.js)
         {                          ├─→ polls each file until ACTIVE
@@ -44,6 +48,20 @@ Browser (React, static assets served by the Worker)
 Video bytes are streamed through the Worker rather than sent browser→Google directly, so
 `GEMINI_API_KEY` never reaches the client. Only tiny file *references* ride in JSON bodies,
 so request-size limits are irrelevant — this is what fixed the original 413.
+
+**Why chunked, and why not upload straight to Google?** Cloudflare caps any single request
+body at 100MB (Free/Pro), which is smaller than a full heat. Uploading direct from the
+browser would sidestep that, and the signed session URL needs no API key — but it does not
+work: the CORS preflight succeeds while Google's response to the actual upload POST carries
+no `Access-Control-Allow-Origin`, so the browser blocks it. Both were verified empirically
+(headless Chrome, real requests). Chunking is therefore the route: each slice is ~16MB, and
+the total is bounded only by Gemini's 2GB per-file limit.
+
+Non-final chunks must be a multiple of the granularity Google reports in
+`x-goog-upload-chunk-granularity` (8MB today); `/api/upload-url` passes it to the client
+rather than hardcoding it. Because the client supplies the session URL back to
+`/api/upload-chunk`, that endpoint validates the host before fetching — without it, it
+would be an open SSRF proxy.
 
 ## Resolved Bug — "Body is disturbed or locked" / 413 (fixed 2026-08-10)
 
@@ -77,8 +95,9 @@ Gemini Files API in ~5s and reached `ACTIVE`. Endpoints return correct 400s inst
 | File | Purpose |
 |---|---|
 | `src/FloorCritic.jsx` | Main React component. `uploadFileToGemini()` and `analyse()` carry `[analyse]` / `[uploadFileToGemini]` console breadcrumbs. |
-| `worker/index.js` | Worker entry. Routes `/api/upload` + `/api/analyse`, serves `dist/` via ASSETS, stamps COOP/COEP. |
-| `worker/upload.js` | Streams video bytes to the Gemini Files API, returns `{name, uri, mimeType, state}`. |
+| `worker/index.js` | Worker entry. Routes the three `/api/*` endpoints, serves `dist/` via ASSETS, stamps COOP/COEP. |
+| `worker/upload-url.js` | Opens a Gemini resumable session; returns `{uploadUrl, granularity}`. |
+| `worker/upload-chunk.js` | Forwards one slice at a byte offset. Host-validates the URL (SSRF guard). |
 | `worker/analyse.js` | Takes `{systemPrompt, userPrompt, files}`, polls to ACTIVE, calls gemini-2.5-pro. |
 | `wrangler.toml` | Worker config: `main`, `[assets] directory/binding`, `run_worker_first`. |
 | `vite.config.js` | Same COOP/COEP headers for `vite` dev server. |
@@ -134,7 +153,7 @@ Highest priority in rough order:
 
 ## Constraints and known limitations
 
-- **Cloudflare Workers free plan**: 100MB request body. Workers CPU limit (10ms free) counts computation only — time awaiting Gemini is I/O and doesn't count. Very long heats could still hit client/connection timeouts; if that happens, move to an async job + polling pattern backed by Workers KV.
+- **Cloudflare Workers free plan**: 100MB per request body (worked around by 16MB chunking; total upload size is unbounded by this). Workers CPU limit (10ms free) counts computation only — time awaiting Gemini is I/O and doesn't count. Very long heats could still hit client/connection timeouts; if that happens, move to an async job + polling pattern backed by Workers KV.
 - **iPhone HEVC/H.265**: Safari can play these but `<canvas>.drawImage()` fails. We use ffmpeg.wasm to transcode when detected.
 - **Gemini 2.5 Pro pricing**: ~$0.05-$0.15 per analysis. Rate limits: 5/hour/IP, 50/day global (advisory, in-memory).
 - **iOS Safari upload** can be flaky for large files — needs testing on desktop Chrome before assuming it works everywhere.

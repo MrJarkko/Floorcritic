@@ -402,31 +402,84 @@ export default function FloorCritic() {
     });
   }, []);
 
-  // ─── Upload one video to Gemini (via our /api/upload Worker) ───
-  // Bytes stream browser → Worker → Gemini Files API. We get back a tiny
-  // reference ({name, uri, mimeType, state}) — the video itself never rides
-  // inside a JSON body, so request-size limits no longer apply.
-  const uploadFileToGemini = async (file, mimeType) => {
-    console.log("[uploadFileToGemini] uploading", file.name, (file.size / 1e6).toFixed(1), "MB", mimeType);
-    const res = await fetch("/api/upload", {
+  // Target slice size. The actual size is rounded up to a multiple of the
+  // granularity Google reports for the session (8MB today) — non-final chunks
+  // that aren't a multiple are rejected. Stays well under Cloudflare's 100MB cap.
+  const TARGET_CHUNK_SIZE = 16 * 1024 * 1024;
+
+  // POST one slice via XHR so we get byte-level progress for the status line.
+  const sendChunk = (uploadUrl, chunk, offset, isLast, onBytes) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload-chunk", true);
+    xhr.setRequestHeader("x-upload-url", uploadUrl);
+    xhr.setRequestHeader("x-goog-upload-offset", String(offset));
+    xhr.setRequestHeader("x-goog-upload-command", isLast ? "upload, finalize" : "upload");
+    xhr.setRequestHeader("x-chunk-length", String(chunk.size));
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && onBytes) onBytes(e.loaded); };
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let msg = `Upload failed (${xhr.status})`;
+        try { const j = JSON.parse(xhr.responseText); if (j.error) msg = j.error; } catch { /* keep default */ }
+        reject(new Error(msg));
+        return;
+      }
+      try { resolve(JSON.parse(xhr.responseText)); }
+      catch { reject(new Error("Unreadable upload response.")); }
+    };
+    xhr.onerror = () => reject(new Error("Network error during upload. Check your connection and try again."));
+    xhr.send(chunk);
+  });
+
+  // ─── Upload one video to Gemini ───
+  // Open a resumable session via our Worker (which holds GEMINI_API_KEY), then
+  // push the file through /api/upload-chunk in slices. Chunking is what lifts the
+  // old size ceiling: Cloudflare caps any single request body at 100MB, but the
+  // total is bounded only by Gemini's 2GB per-file limit.
+  //
+  // The browser cannot POST to Google directly — verified: the CORS preflight
+  // passes but Google's actual upload response omits Access-Control-Allow-Origin,
+  // so the browser blocks it.
+  const uploadFileToGemini = async (file, mimeType, onProgress) => {
+    console.log("[uploadFileToGemini] start", file.name, (file.size / 1e6).toFixed(1), "MB", mimeType);
+
+    const res = await fetch("/api/upload-url", {
       method: "POST",
-      headers: {
-        "x-goog-upload-header-content-type": mimeType,
-        "x-goog-upload-header-content-length": String(file.size),
-        "x-display-name": file.name,
-      },
-      body: file, // raw bytes, streamed — no base64
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ displayName: file.name, mimeType, numBytes: file.size }),
     });
+    const raw = await res.text();
     if (!res.ok) {
-      const raw = await res.text();
-      let msg = `Upload failed (${res.status})`;
-      try { const j = JSON.parse(raw); if (j.error) msg = j.error; } catch { msg = `Upload ${res.status}: ${raw.slice(0, 200)}`; }
-      console.error("[uploadFileToGemini] failed:", msg);
+      let msg = `Could not start upload (${res.status})`;
+      try { const j = JSON.parse(raw); if (j.error) msg = j.error; } catch { msg = `${msg}: ${raw.slice(0, 200)}`; }
+      console.error("[uploadFileToGemini] session failed:", msg);
       throw new Error(msg);
     }
-    const f = await res.json();
-    console.log("[uploadFileToGemini] uploaded →", f.name, f.state);
-    return f; // { name, uri, mimeType, state }
+    const { uploadUrl, granularity } = JSON.parse(raw);
+    if (!uploadUrl) throw new Error("No upload URL returned");
+
+    // Round the target up to a whole number of granularity units.
+    const gran = granularity || 8 * 1024 * 1024;
+    const chunkSize = Math.max(gran, Math.ceil(TARGET_CHUNK_SIZE / gran) * gran);
+
+    const totalChunks = Math.max(1, Math.ceil(file.size / chunkSize));
+    console.log(`[uploadFileToGemini] session open, ${totalChunks} chunk(s) of ${(chunkSize / 1048576).toFixed(0)}MB (granularity ${(gran / 1048576).toFixed(0)}MB)`);
+
+    let result = null;
+    for (let offset = 0, i = 0; offset < file.size || i === 0; offset += chunkSize, i++) {
+      const end = Math.min(offset + chunkSize, file.size);
+      const chunk = file.slice(offset, end);
+      const isLast = end >= file.size;
+      const base = offset;
+      result = await sendChunk(uploadUrl, chunk, offset, isLast, (loaded) => {
+        if (onProgress) onProgress(Math.min(1, (base + loaded) / file.size));
+      });
+      console.log(`[uploadFileToGemini] chunk ${i + 1}/${totalChunks} done (${end}/${file.size} bytes)`);
+      if (isLast) break;
+    }
+
+    if (!result?.name) throw new Error("Upload finished but Gemini returned no file reference.");
+    console.log("[uploadFileToGemini] uploaded →", result.name, result.state);
+    return result; // { name, uri, mimeType, state }
   };
 
   // ─── Helper: transcode HEVC to H.264 via ffmpeg.wasm if needed ───
@@ -514,13 +567,16 @@ export default function FloorCritic() {
       // collecting the lightweight file references we'll pass to /api/analyse.
       const totalMB = preparedVideos.reduce((s, pv) => s + pv.file.size, 0) / 1024 / 1024;
       console.log(`[analyse] Step 3: uploading ${preparedVideos.length} video(s), ${totalMB.toFixed(1)} MB total`);
-      if (totalMB > 90) {
-        throw new Error(`Total video size ${totalMB.toFixed(0)}MB exceeds 90MB limit. Trim videos or reduce resolution.`);
-      }
       const files = [];
       for (let i = 0; i < preparedVideos.length; i++) {
-        setProgress(`Uploading video ${i + 1} of ${preparedVideos.length}…`);
-        const uploaded = await uploadFileToGemini(preparedVideos[i].file, preparedVideos[i].mimeType);
+        const label = preparedVideos.length > 1 ? `video ${i + 1} of ${preparedVideos.length}` : "video";
+        const sizeMB = preparedVideos[i].file.size / 1024 / 1024;
+        setProgress(`Uploading ${label}… 0%`);
+        const uploaded = await uploadFileToGemini(
+          preparedVideos[i].file,
+          preparedVideos[i].mimeType,
+          (frac) => setProgress(`Uploading ${label}… ${Math.round(frac * 100)}% of ${sizeMB.toFixed(0)}MB`)
+        );
         files.push({ name: uploaded.name, mimeType: uploaded.mimeType });
       }
       console.log("[analyse] all uploads done, file refs:", files.map(f => f.name));
@@ -833,7 +889,7 @@ Be specific, objective, and honest. The user is a competitor seeking to improve.
               )}
 
               <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(71,181,232,0.06)", border: "1px solid rgba(71,181,232,0.15)", borderRadius: 8, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.55)", lineHeight: 1.6 }}>
-                💡 <strong style={{ color: "#47B5E8" }}>Full video analysis:</strong> Unlike frame-based tools, FloorCritic analyses the complete video including audio so it can evaluate musicality and timing. Upload up to 3 angles of the same performance for best results. Max 90MB total.
+                💡 <strong style={{ color: "#47B5E8" }}>Full video analysis:</strong> Unlike frame-based tools, FloorCritic analyses the complete video including audio so it can evaluate musicality and timing. Upload up to 3 angles of the same performance for best results. Full-length heats are fine — up to 2GB per video.
               </div>
             </section>
 

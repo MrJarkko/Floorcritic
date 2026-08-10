@@ -1,8 +1,9 @@
 // POST /api/analyse
 //
-// Receives only tiny file REFERENCES (videos were already streamed to Gemini via
-// /api/upload), waits for each to finish processing, then asks Gemini 2.5 Pro to
-// adjudicate. Raw fetch against the Gemini REST API — no Node SDK, Workers-native.
+// Receives only tiny file REFERENCES (the browser already uploaded the videos
+// straight to Gemini using a signed URL from /api/upload-url), waits for each to
+// finish processing, then asks Gemini 2.5 Pro to adjudicate. Raw fetch against
+// the Gemini REST API — no Node SDK, Workers-native.
 
 const GEMINI = "https://generativelanguage.googleapis.com";
 const MODEL = "gemini-2.5-pro";

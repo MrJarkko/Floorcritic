@@ -4,7 +4,8 @@
 // functions/api/upload.js -> /api/upload automatically, but a Worker needs one
 // entry script that routes explicitly and serves static assets via env.ASSETS.
 
-import { handleUpload } from "./upload.js";
+import { handleUploadUrl } from "./upload-url.js";
+import { handleUploadChunk } from "./upload-chunk.js";
 import { handleAnalyse } from "./analyse.js";
 
 // ffmpeg.wasm needs SharedArrayBuffer, which requires cross-origin isolation.
@@ -25,8 +26,11 @@ export default {
   async fetch(request, env, ctx) {
     const { pathname } = new URL(request.url);
 
-    if (pathname === "/api/upload") {
-      return request.method === "POST" ? handleUpload(request, env) : methodNotAllowed();
+    if (pathname === "/api/upload-url") {
+      return request.method === "POST" ? handleUploadUrl(request, env) : methodNotAllowed();
+    }
+    if (pathname === "/api/upload-chunk") {
+      return request.method === "POST" ? handleUploadChunk(request, env) : methodNotAllowed();
     }
     if (pathname === "/api/analyse") {
       return request.method === "POST" ? handleAnalyse(request, env) : methodNotAllowed();
