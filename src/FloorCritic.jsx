@@ -16,6 +16,18 @@ const COUPLE_COLORS = [
 ];
 
 function ScoreBar({ score, max = 10 }) {
+  // null means the model judged this criterion unassessable from the footage —
+  // show that plainly instead of implying a zero.
+  if (typeof score !== "number" || !isFinite(score)) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,0.05)", borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ width: "100%", height: "100%", background: "repeating-linear-gradient(90deg, rgba(255,255,255,0.10) 0 4px, transparent 4px 8px)" }} />
+        </div>
+        <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.35)", minWidth: 28 }}>n/a</span>
+      </div>
+    );
+  }
   const pct = (score / max) * 100;
   const color = score >= 8 ? "#7BE847" : score >= 6 ? "#E8C547" : "#E85D47";
   return (
@@ -25,6 +37,25 @@ function ScoreBar({ score, max = 10 }) {
       </div>
       <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 12, color, minWidth: 28 }}>{score.toFixed(1)}</span>
     </div>
+  );
+}
+
+// How clearly the model could actually observe this couple.
+function EvidenceBadge({ quality }) {
+  if (!quality) return null;
+  const map = {
+    good: { label: "CLEARLY SEEN", color: "#7BE847" },
+    partial: { label: "PARTLY VISIBLE", color: "#E8C547" },
+    poor: { label: "BARELY VISIBLE", color: "#E85D47" },
+  };
+  const m = map[String(quality).toLowerCase()];
+  if (!m) return null;
+  return (
+    <span style={{
+      fontFamily: "'DM Mono', monospace", fontSize: 9, letterSpacing: 1,
+      color: m.color, border: `1px solid ${m.color}44`, background: `${m.color}14`,
+      borderRadius: 4, padding: "2px 6px", whiteSpace: "nowrap",
+    }}>{m.label}</span>
   );
 }
 
@@ -88,8 +119,11 @@ function CoupleCard({ couple, rank, color, expanded, onToggle }) {
               {couple.thumbnail_hint}
             </div>
           )}
-          <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.5)", marginTop: 2 }}>
-            Overall: {couple.overall?.toFixed(1) ?? "—"} / 10
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.5)" }}>
+              {typeof couple.overall === "number" ? `Overall: ${couple.overall.toFixed(1)} / 10` : "Overall: not assessable"}
+            </span>
+            <EvidenceBadge quality={couple.evidence_quality} />
           </div>
         </div>
         <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 11, color: "rgba(240,236,224,0.4)", transform: expanded ? "rotate(180deg)" : "none", transition: "transform 0.2s", flexShrink: 0 }}>▼</div>
@@ -140,6 +174,12 @@ function CoupleCard({ couple, rank, color, expanded, onToggle }) {
               {couple.faults.map((f, i) => (
                 <div key={i} style={{ fontFamily: "'Lora', serif", fontSize: 13, color: "rgba(240,236,224,0.75)", lineHeight: 1.6, marginBottom: 4, paddingLeft: 12, borderLeft: "2px solid rgba(232,93,71,0.3)" }}>{f}</div>
               ))}
+            </div>
+          )}
+
+          {!couple.positives?.length && !couple.faults?.length && (
+            <div style={{ marginTop: 14, fontFamily: "'Lora', serif", fontStyle: "italic", fontSize: 12, color: "rgba(240,236,224,0.4)", lineHeight: 1.6 }}>
+              No specific observations could be grounded in the footage for this couple.
             </div>
           )}
 
@@ -241,166 +281,6 @@ export default function FloorCritic() {
     }
   }, []);
 
-  // ─── Extract frames via ffmpeg.wasm (handles HEVC / all formats) ───
-  const extractFramesFFmpeg = useCallback(async (file, count = 6) => {
-    setProgress("Converting video (HEVC → JPEG frames)…");
-    const { ffmpeg, fetchFile } = await loadFFmpeg();
-
-    const inputName = "input" + (file.name.match(/\.[a-z0-9]+$/i)?.[0] || ".mov");
-    await ffmpeg.writeFile(inputName, await fetchFile(file));
-
-    // First: probe duration by transcoding briefly, or estimate from metadata
-    // Simpler: extract `count` evenly-spaced frames using fps filter based on duration
-    // We'll use a two-step approach: probe, then extract
-
-    // Step 1: extract frames at evenly spaced intervals
-    // -vf "fps=N/duration" would need duration probing; instead use a trick:
-    // Extract 1 frame per (total_frames / count) using select filter
-    // Simplest: use -vf thumbnail and -vframes count
-    setProgress("Extracting frames…");
-
-    // Use scale filter to keep files small + select evenly
-    // We'll extract `count` frames using select='not(mod(n, N/count))' — but we don't know N
-    // Easiest reliable approach: use -ss seeks for each frame position after probing duration
-
-    // Probe duration via a quick ffprobe-ish call
-    let duration = 0;
-    ffmpeg.on("log", ({ message }) => {
-      const m = message.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
-      if (m) duration = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
-    });
-    try {
-      await ffmpeg.exec(["-i", inputName, "-f", "null", "-"]);
-    } catch { /* exit code non-zero is expected here */ }
-
-    if (!duration || duration < 1) {
-      throw new Error("Could not determine video duration.");
-    }
-    console.log("FFmpeg probed duration:", duration, "s");
-
-    // Step 2: extract each frame via -ss seek
-    const frames = [];
-    // Skip first 10% and last 10% (lineup/bowing segments)
-    const startPad = duration * 0.10;
-    const active = duration * 0.80;
-
-    for (let i = 0; i < count; i++) {
-      const t = startPad + (active / (count + 1)) * (i + 1);
-      setProgress(`Extracting frame ${i + 1} of ${count}…`);
-      const outName = `frame_${i}.jpg`;
-      await ffmpeg.exec([
-        "-ss", t.toFixed(2),
-        "-i", inputName,
-        "-frames:v", "1",
-        "-vf", "scale=512:-2",
-        "-q:v", "5",
-        outName,
-      ]);
-      const data = await ffmpeg.readFile(outName);
-      // Convert Uint8Array → base64
-      let binary = "";
-      const bytes = new Uint8Array(data);
-      const chunk = 0x8000;
-      for (let j = 0; j < bytes.length; j += chunk) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(j, j + chunk));
-      }
-      frames.push({ b64: btoa(binary), t });
-      await ffmpeg.deleteFile(outName);
-    }
-    await ffmpeg.deleteFile(inputName);
-    console.log(`FFmpeg extracted ${frames.length} frames`);
-    return frames;
-  }, [loadFFmpeg]);
-
-  const extractFrames = useCallback(async (file, count = 8) => {
-    return new Promise((resolve, reject) => {
-      console.log("Starting frame extraction. File:", file.name, file.type, file.size, "bytes");
-      const video = document.createElement("video");
-      const objectUrl = URL.createObjectURL(file);
-      video.src = objectUrl;
-      video.muted = true;
-      video.playsInline = true;
-      video.preload = "auto";
-      const frames = [];
-
-      const cleanup = () => URL.revokeObjectURL(objectUrl);
-
-      const timeout = setTimeout(() => {
-        console.warn("Frame extraction timeout. Extracted:", frames.length);
-        cleanup();
-        if (frames.length >= 3) resolve(frames);
-        else reject(new Error(`Timeout extracting frames (got ${frames.length}/${count}). File may be HEVC/H.265 which browsers can't decode. Try re-encoding to H.264 MP4.`));
-      }, 45000);
-
-      video.onloadedmetadata = () => {
-        const duration = video.duration;
-        const w = video.videoWidth;
-        const h = video.videoHeight;
-        console.log("Metadata loaded. Duration:", duration, "Dimensions:", w, "x", h);
-
-        if (!duration || !isFinite(duration)) {
-          clearTimeout(timeout);
-          cleanup();
-          reject(new Error("Video duration is invalid. File may be corrupt or in an unsupported codec."));
-          return;
-        }
-        if (!w || !h) {
-          clearTimeout(timeout);
-          cleanup();
-          reject(new Error("Video has no visible dimensions — likely HEVC/H.265 codec that this browser can't decode. Re-encode to H.264 MP4 (any video editor / HandBrake / QuickTime 'Export As').") );
-          return;
-        }
-
-        // Skip first 10% and last 10% of video (typically lineup / bowing)
-        const startPad = duration * 0.10;
-        const endPad = duration * 0.90;
-        const active = endPad - startPad;
-        const times = Array.from({ length: count }, (_, i) => startPad + (active / (count + 1)) * (i + 1));
-        let idx = 0;
-        const capture = () => {
-          if (idx >= times.length) {
-            clearTimeout(timeout);
-            cleanup();
-            resolve(frames);
-            return;
-          }
-          video.currentTime = times[idx];
-        };
-        video.onseeked = () => {
-          try {
-            const canvas = document.createElement("canvas");
-            const aspect = h / w;
-            canvas.width = 512;
-            canvas.height = Math.round(512 * aspect);
-            const ctx = canvas.getContext("2d");
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL("image/jpeg", 0.6);
-            if (dataUrl === "data:," || dataUrl.length < 1000) {
-              console.warn("Frame", idx, "appears empty — codec decode may have failed");
-            } else {
-              frames.push({ b64: dataUrl.split(",")[1], t: times[idx] });
-            }
-            idx++;
-            capture();
-          } catch (e) {
-            console.error("Frame capture error at index", idx, e);
-            idx++;
-            capture();
-          }
-        };
-        capture();
-      };
-      video.onerror = (e) => {
-        clearTimeout(timeout);
-        cleanup();
-        const mediaError = video.error;
-        const code = mediaError?.code;
-        const msg = mediaError?.message;
-        console.error("Video load error. Code:", code, "Msg:", msg, "Event:", e);
-        reject(new Error(`Video could not be loaded (error ${code || "?"}). ${code === 4 ? "Codec not supported — likely HEVC/H.265. Re-encode to H.264 MP4." : msg || "Try re-encoding to H.264 MP4."}`));
-      };
-    });
-  }, []);
 
   // Target slice size. The actual size is rounded up to a multiple of the
   // granularity Google reports for the session (8MB today) — non-final chunks
@@ -521,20 +401,103 @@ export default function FloorCritic() {
     return { file: newFile, mimeType: "video/mp4" };
   }, [loadFFmpeg]);
 
-  // ─── Extract 1 thumbnail from video for UI display (local-only) ───
-  const extractThumbnail = useCallback(async (file) => {
+  // ─── Extract one frame per couple, at the moment Gemini says each is best seen ───
+  // specs: [{ t: seconds, box: [ymin,xmin,ymax,xmax] 0-1000 | null }]
+  // Seeks a single <video> through the requested times in order, so one pass covers
+  // every couple. Returns base64 JPEGs (null where a frame couldn't be captured).
+  const extractFramesAtTimes = useCallback(async (file, specs) => {
+    if (!specs.length) return [];
+
+    const video = document.createElement("video");
+    const objectUrl = URL.createObjectURL(file);
+    const results = new Array(specs.length).fill(null);
+
+    // Resolve on an event, but never hang if the event never arrives — a stalled
+    // seek must cost us one thumbnail, not all of them.
+    const once = (target, event, ms) => new Promise((res) => {
+      let done = false;
+      const on = () => { if (!done) { done = true; cleanup(); res(true); } };
+      const timer = setTimeout(() => { if (!done) { done = true; cleanup(); res(false); } }, ms);
+      const cleanup = () => { clearTimeout(timer); target.removeEventListener(event, on); };
+      target.addEventListener(event, on);
+    });
+
     try {
-      const frames = await extractFrames(file, 1);
-      return frames?.[0]?.b64 || null;
-    } catch {
-      try {
-        const frames = await extractFramesFFmpeg(file, 1);
-        return frames?.[0]?.b64 || null;
-      } catch {
-        return null;
+      video.src = objectUrl;
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = "auto";
+
+      if (video.readyState < 1) await once(video, "loadedmetadata", 15000);
+      const dur = video.duration, vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh || !isFinite(dur) || dur <= 0) {
+        console.warn("[thumbnails] no usable video dimensions/duration; skipping");
+        return results;
       }
+      // Seeking is far more reliable once actual frame data is buffered.
+      if (video.readyState < 2) await once(video, "loadeddata", 15000);
+
+      for (let i = 0; i < specs.length; i++) {
+        const raw = Number(specs[i]?.t);
+        const t = isFinite(raw) && raw > 0
+          ? Math.min(Math.max(raw, 0.1), Math.max(0.1, dur - 0.1))
+          : dur * (0.15 + 0.7 * ((i + 1) / (specs.length + 1)));
+
+        try {
+          if (Math.abs(video.currentTime - t) > 0.05) {
+            const seeked = once(video, "seeked", 6000);
+            video.currentTime = t;
+            const ok = await seeked;
+            if (!ok) console.warn(`[thumbnails] seek to ${t.toFixed(1)}s did not signal; drawing anyway`);
+          }
+          // Wait for a frame to actually be presented where the browser supports it.
+          if (typeof video.requestVideoFrameCallback === "function") {
+            await new Promise((res) => {
+              const id = setTimeout(res, 1000);
+              video.requestVideoFrameCallback(() => { clearTimeout(id); res(); });
+            });
+          }
+
+          const box = specs[i]?.box;
+          // Default to the full frame; crop to the couple when a sane box is given.
+          let sx = 0, sy = 0, sw = vw, sh = vh;
+          if (Array.isArray(box) && box.length === 4 && box.every((n) => typeof n === "number")) {
+            const [ymin, xmin, ymax, xmax] = box;
+            if (ymax > ymin && xmax > xmin && xmin >= 0 && ymin >= 0 && xmax <= 1000 && ymax <= 1000) {
+              const bx = (xmin / 1000) * vw;
+              const by = (ymin / 1000) * vh;
+              const bw = ((xmax - xmin) / 1000) * vw;
+              const bh = ((ymax - ymin) / 1000) * vh;
+              // Pad around the box so the couple isn't cropped tight to the edges.
+              const pad = Math.max(bw, bh) * 0.25;
+              sx = Math.max(0, bx - pad);
+              sy = Math.max(0, by - pad);
+              sw = Math.min(vw - sx, bw + pad * 2);
+              sh = Math.min(vh - sy, bh + pad * 2);
+            }
+          }
+
+          const maxEdge = 640;
+          const scale = Math.min(1, maxEdge / Math.max(sw, sh));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(sw * scale));
+          canvas.height = Math.max(1, Math.round(sh * scale));
+          canvas.getContext("2d").drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+          // A blank/undecoded frame compresses to almost nothing — treat as a miss.
+          if (dataUrl.length > 2000) results[i] = dataUrl.split(",")[1];
+        } catch (e) {
+          console.warn("[thumbnails] capture failed at index", i, e);
+        }
+      }
+    } finally {
+      video.src = "";
+      URL.revokeObjectURL(objectUrl);
     }
-  }, [extractFrames, extractFramesFFmpeg]);
+
+    console.log(`[thumbnails] captured ${results.filter(Boolean).length}/${specs.length}`);
+    return results;
+  }, []);
 
   const analyse = async () => {
     console.log("[analyse] START — videos:", videos.length, videos.map(v => ({ name: v.file.name, sizeMB: (v.file.size / 1e6).toFixed(1), type: v.file.type })));
@@ -554,14 +517,8 @@ export default function FloorCritic() {
         preparedVideos.push({ file, mimeType, originalId: videos[i].id });
       }
 
-      // Step 2: Extract 1 thumbnail from each video for UI
-      console.log("[analyse] Step 2: extractThumbnail");
-      setProgress("Generating thumbnails…");
-      const thumbnails = [];
-      for (const pv of preparedVideos) {
-        const thumb = await extractThumbnail(pv.file);
-        thumbnails.push(thumb);
-      }
+      // Thumbnails are extracted AFTER analysis — Gemini tells us which moment
+      // shows each couple best, so there is nothing useful to capture up front.
 
       // Step 3: Upload each video directly to Gemini (streamed via our Worker),
       // collecting the lightweight file references we'll pass to /api/analyse.
@@ -585,7 +542,24 @@ export default function FloorCritic() {
       const criteria = WDSF_CRITERIA[danceStyle].join(", ");
       const multiVideo = videos.length > 1;
 
-      const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance adjudicator analysing competition video footage. You have 20+ years of international judging experience. You provide specific, constructive technical feedback using official WDSF adjudication criteria.
+      const systemPrompt = `You are a WDSF (World Dance Sport Federation) ballroom dance adjudicator analysing competition video footage, applying official WDSF adjudication criteria.
+
+Your usefulness depends entirely on being accurate about what is ACTUALLY VISIBLE in this footage. The user is a competitor who will act on your feedback. A short, honest assessment is far more valuable than a complete-looking one built on plausible guesses. Competition video is usually shot from a distance, hand-held, with couples repeatedly blocked by other couples — you are expected to be unable to assess many things, and saying so is a correct answer.
+
+EVIDENCE RULES — these override every other instruction:
+- Report ONLY what you can see or hear in this specific footage. Never supply typical or expected dance-coaching commentary.
+- Every entry in "positives" and "faults" MUST begin with a timestamp of the moment you observed it, formatted [M:SS]. If you cannot point to a specific moment, do not make the claim at all.
+- If a criterion cannot be judged (couple too distant, blocked, out of frame, motion-blurred, bad angle), set that score to null. Do NOT estimate a plausible number.
+- Fewer, well-grounded observations beat many plausible ones. Empty arrays are correct for a couple who is rarely in clear view.
+- If you cannot track a couple as a distinct pair through the heat, OMIT them entirely rather than guessing.
+- If the audio is missing or too poor to hear the beat, set Timing & Musicality to null for everyone and say so in footage_limitations.
+
+NEVER FABRICATE:
+- Bib numbers. If you cannot literally read the digits, set "number": null.
+- Facial expressions or eye contact when faces are too small to resolve.
+- Specific footwork or foot positions you did not clearly see.
+- Costume or appearance details beyond what is actually distinguishable.
+- A complete ranking of couples you could not genuinely compare.
 
 ${multiVideo ? `IMPORTANT: You are receiving ${videos.length} DIFFERENT camera angles of the SAME heat. Synthesise observations across all angles for each couple — different angles reveal different technical details.` : ""}
 
@@ -603,6 +577,11 @@ COUPLE IDENTIFICATION (CRITICAL):
 - If you cannot clearly read a bib number, set "number" to null and describe the couple in "thumbnail_hint" (e.g. "red dress, tall male partner").
 - NEVER invent bib numbers.
 
+THUMBNAIL FRAME (needed to illustrate each couple):
+- For every couple, give "best_frame_time": the time in SECONDS (a number, e.g. 47.5) at the moment this couple is most clearly and unobstructedly visible.
+- Pick a moment where this couple is large in frame and not blocked by others. Different couples should generally have different times.
+- Optionally add "box": [ymin, xmin, ymax, xmax] locating the couple in that frame, each 0-1000 normalised to image height/width. Include it only if you are confident; omit otherwise.
+
 Respond ONLY with a valid JSON object matching this schema exactly:
 {
   "dance": "${dance}",
@@ -610,25 +589,29 @@ Respond ONLY with a valid JSON object matching this schema exactly:
   "angles_analysed": ${videos.length},
   "ranked_couples": [
     {
-      "number": <bib number integer or null>,
+      "number": <bib number integer, or null if not readable>,
       "number_confidence": <"high" | "medium" | "low">,
-      "thumbnail_hint": "<short visual description>",
-      "rank": <integer, 1 is best>,
-      "overall": <number 0-10, one decimal>,
+      "thumbnail_hint": "<short visual description, only details actually distinguishable>",
+      "best_frame_time": <seconds as a number>,
+      "box": <[ymin,xmin,ymax,xmax] 0-1000, or omit>,
+      "evidence_quality": <"good" | "partial" | "poor" — how clearly you could actually observe this couple>,
+      "rank": <integer, 1 is best, among the couples you report>,
+      "overall": <number 0-10 one decimal, or null if too little was assessable>,
       "scores": {
-${WDSF_CRITERIA[danceStyle].map(c => `        "${c}": <number 0-10, one decimal>`).join(",\n")}
+${WDSF_CRITERIA[danceStyle].map(c => `        "${c}": <number 0-10 one decimal, or null if not assessable>`).join(",\n")}
       },
-      "positives": [<3-5 specific observations>],
-      "faults": [<3-5 specific observations>],
-      "summary": "<2-3 sentence technical assessment>"
+      "positives": [<0-4 observations, each starting with [M:SS]. Use [] if none are grounded.>],
+      "faults": [<0-4 observations, each starting with [M:SS]. Use [] if none are grounded.>],
+      "summary": "<2-3 sentences. State plainly if visibility limited the assessment.>"
     }
   ],
-  "heat_summary": "<overall heat assessment>",
-  "standout_couple": <bib number of top couple or null>,
-  "identification_notes": "<notes about unreadable bib numbers>"
+  "heat_summary": "<overall heat assessment based only on what was visible>",
+  "standout_couple": <bib number of top couple, or null if no confident pick>,
+  "identification_notes": "<notes about unreadable bib numbers>",
+  "footage_limitations": "<what this footage did NOT allow you to assess, and why (distance, blocking, audio, resolution). Write 'None significant' only if genuinely so.>"
 }
 
-Return one entry per couple visible. Expected ~${numCouples} couples. Each gets a unique rank from 1 to N.`;
+Report only couples you could actually distinguish and follow. The user expects roughly ${numCouples} couples, but returning fewer with honest detail is better than padding the list. Rank the couples you do report, 1 = best.`;
 
       const userPrompt = `Analyse this WDSF ${danceStyle} ${dance} competition footage (${round}).
 Competition: ${competition || "WDSF competition"}
@@ -637,7 +620,7 @@ Angles provided: ${videos.length}${myCoupleEnabled && myCouple ? `\nUser's bib n
 
 WDSF criteria: ${criteria}
 
-Be specific, objective, and honest. The user is a competitor seeking to improve.`;
+Be specific, objective, and honest. The user is a competitor seeking to improve, and will act on what you say — so ground every observation in a moment you actually saw, and use null / empty arrays wherever the footage does not support a judgement.`;
 
       setProgress("Sending to Gemini for WDSF analysis… (this may take 30-90s)");
 
@@ -687,11 +670,23 @@ Be specific, objective, and honest. The user is a competitor seeking to improve.
         throw new Error("Analysis response missing couples data.");
       }
 
-      // Attach colours and thumbnails (cycle through extracted thumbnails)
+      // Grab one frame per couple at the moment Gemini flagged, cropped to its box
+      // when it supplied one. Best-effort: a failure here must not lose the analysis.
+      setProgress("Capturing couple thumbnails…");
+      let thumbs = [];
+      try {
+        thumbs = await extractFramesAtTimes(
+          preparedVideos[0].file,
+          parsed.ranked_couples.map((c) => ({ t: c.best_frame_time, box: c.box }))
+        );
+      } catch (e) {
+        console.warn("[analyse] thumbnail extraction failed, continuing without:", e);
+      }
+
       parsed.ranked_couples = parsed.ranked_couples.map((c, i) => ({
         ...c,
         color: COUPLE_COLORS[i % COUPLE_COLORS.length],
-        thumbnail: thumbnails[i % thumbnails.length] || null,
+        thumbnail: thumbs[i] || null,
       }));
 
       setResults(parsed);
@@ -949,7 +944,9 @@ Be specific, objective, and honest. The user is a competitor seeking to improve.
                     </div>
                     <div style={{ width: 1, height: 50, background: "rgba(232,197,71,0.2)" }} />
                     <div style={{ textAlign: "center" }}>
-                      <div style={{ fontFamily: "'Playfair Display', serif", fontSize: 40, fontWeight: 700, color: "#E8C547", lineHeight: 1 }}>{featured.overall?.toFixed(1)}</div>
+                      <div style={{ fontFamily: "'Playfair Display', serif", fontSize: 40, fontWeight: 700, color: "#E8C547", lineHeight: 1 }}>
+                        {typeof featured.overall === "number" ? featured.overall.toFixed(1) : "—"}
+                      </div>
                       <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.35)", marginTop: 4 }}>OVERALL / 10</div>
                     </div>
                     <div style={{ flex: 1 }}>
@@ -967,6 +964,13 @@ Be specific, objective, and honest. The user is a competitor seeking to improve.
               </div>
             )}
 
+            {/* What the footage did not allow — sets expectations before the scores */}
+            {results.footage_limitations && !/^none significant\.?$/i.test(results.footage_limitations.trim()) && (
+              <div style={{ background: "rgba(232,93,71,0.06)", border: "1px solid rgba(232,93,71,0.2)", borderRadius: 8, padding: "10px 14px", marginBottom: 12, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.6)", lineHeight: 1.6 }}>
+                <strong style={{ color: "#E85D47" }}>FOOTAGE LIMITS:</strong> {results.footage_limitations}
+              </div>
+            )}
+
             {/* Identification notes */}
             {results.identification_notes && (
               <div style={{ background: "rgba(232,197,71,0.05)", border: "1px solid rgba(232,197,71,0.15)", borderRadius: 8, padding: "10px 14px", marginBottom: 20, fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.55)", lineHeight: 1.6 }}>
@@ -976,7 +980,7 @@ Be specific, objective, and honest. The user is a competitor seeking to improve.
 
             {/* Ranked couples */}
             <div style={{ fontFamily: "'DM Mono', monospace", fontSize: 10, color: "rgba(240,236,224,0.3)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>Full Rankings</div>
-            {[...results.ranked_couples].sort((a, b) => a.rank - b.rank).map((couple, idx) => (
+            {[...results.ranked_couples].sort((a, b) => (a.rank ?? 999) - (b.rank ?? 999)).map((couple, idx) => (
               <CoupleCard
                 key={couple.number ?? `unknown-${idx}`}
                 couple={couple}

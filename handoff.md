@@ -116,6 +116,45 @@ Local commands:
 - `npm run dev` — Vite only (UI work; `/api/*` will 404)
 - `npm run cf:dev` — build + `wrangler dev` (full stack, needs Node >= 22)
 
+## Analysis quality (grounding against hallucination)
+
+Gemini was inventing detail. The prompt was the cause, not the model: it demanded
+`3-5 specific observations` of both strengths and faults per couple, six scores to one
+decimal with no null option, and `Expected ~N couples. Each gets a unique rank from 1 to N`.
+Competition video is shot from a distance with couples constantly blocked, so those
+requirements can only be met by making things up.
+
+The prompt now:
+- requires every positive/fault to open with a `[M:SS]` timestamp of the moment observed —
+  an unverifiable claim has nowhere to hide
+- allows `null` per criterion, and `null` overall, when the footage does not support a score
+- asks for 0-4 observations, with empty arrays explicitly correct
+- tells the model to omit couples it cannot track, rather than padding to the expected count
+- adds `evidence_quality` per couple (good/partial/poor) and a heat-level
+  `footage_limitations`, both surfaced in the UI
+- forbids naming facial expressions, footwork, or costume detail that isn't resolvable
+
+Temperature dropped 0.3 -> 0.15. The UI renders `n/a` for null scores rather than implying
+a zero, and says so plainly when a couple has no grounded observations.
+
+## Thumbnails
+
+Previously one frame was extracted per *video* and then assigned to couples by index
+(`thumbnails[i % thumbnails.length]`), so with a single video every couple showed the
+identical mid-heat wide shot — and `null` (nothing rendered) whenever extraction failed.
+
+Now Gemini returns `best_frame_time` (seconds) per couple, plus an optional `box`
+([ymin,xmin,ymax,xmax], 0-1000 normalised). After the analysis returns, the client seeks the
+video to each couple's moment and crops to its box with 25% padding.
+
+The extraction is deliberately defensive, because the original failure mode was total:
+a single stalled seek blocked every remaining capture. Each seek now has its own timeout and
+draws anyway if the `seeked` event never fires, so one bad frame costs one thumbnail.
+Verified in Chrome (`--headless=new`) at 5/5 captured across time-seek, box-crop,
+missing-time fallback, out-of-range clamp, and invalid-box cases. Note that OLD headless
+Chrome cannot seek video at all (metadata loads, `seeked` never fires) — use `--headless=new`
+if you ever re-test this.
+
 ## Product Roadmap (post-bug-fix)
 
 Highest priority in rough order:

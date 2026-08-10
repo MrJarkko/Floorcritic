@@ -94,7 +94,7 @@ export async function handleAnalyse(request, env) {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: "user", parts }],
         generationConfig: {
-          temperature: 0.3,
+          temperature: 0.15,
           maxOutputTokens: 8000,
           responseMimeType: "application/json",
         },
