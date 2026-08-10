@@ -1,15 +1,13 @@
-// Cloudflare Pages Function — POST /api/upload
+// POST /api/upload
 //
 // Streams a video from the browser straight to the Gemini Files API and returns
-// a tiny file reference. The video bytes pass THROUGH this Worker (well within
-// Cloudflare's 100MB request-body limit) but never get buffered in memory —
-// FixedLengthStream pipes them through — and the GEMINI_API_KEY never leaves the
-// server. This is why the browser no longer needs to talk to Google directly
-// (which would hit cross-origin restrictions) and why body-size limits stop
-// mattering: the 4.5MB Vercel wall that caused the original 413 is gone.
+// a tiny file reference. Bytes pass THROUGH this Worker but are never buffered —
+// FixedLengthStream pipes them — and GEMINI_API_KEY never reaches the client.
+// Because only references (not bytes) ride in JSON bodies afterwards, request
+// body limits stop mattering; this is what fixed the original 413.
 
 const GEMINI = "https://generativelanguage.googleapis.com";
-const MAX_BYTES = 100 * 1024 * 1024; // Cloudflare free-plan request-body ceiling
+const MAX_BYTES = 100 * 1024 * 1024;
 
 // Best-effort in-memory rate limit. NOTE: Workers run many short-lived isolates,
 // so this is advisory only — durable limiting needs Workers KV (see roadmap).
@@ -35,7 +33,7 @@ function checkRateLimit(ip) {
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
 
-export async function onRequestPost({ request, env }) {
+export async function handleUpload(request, env) {
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) return json({ error: "Missing GEMINI_API_KEY" }, 500);
 
@@ -76,7 +74,6 @@ export async function onRequestPost({ request, env }) {
     if (!uploadUrl) return json({ error: "No upload URL from Gemini" }, 500);
 
     // 2) Stream the incoming body straight to Gemini with a known length.
-    //    FixedLengthStream sets Content-Length correctly without buffering.
     const { readable, writable } = new FixedLengthStream(numBytes);
     request.body.pipeTo(writable); // runs concurrently with the fetch below
 

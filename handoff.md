@@ -6,33 +6,33 @@
 
 **Target users:** Competitive ballroom dancers (self-analysis), coaches, dance studios.
 
-**Live URL:** https://floorcritic.com (Cloudflare Pages; was floorcritic.vercel.app)
+**Live URL:** https://floorcritic.com (Cloudflare Workers; was floorcritic.vercel.app)
 **Repo:** [your GitHub URL]
 **Owner context:** Jarkko, competitive ballroom dancer based in Estonia. Also a cyber-security professional (day job — no relation to this project).
 
 ## Stack
 
 - **Frontend:** React 18 + Vite, single-file component `src/FloorCritic.jsx`
-- **Backend:** Cloudflare Pages Functions in `functions/api/` (Workers runtime, Fetch API handlers)
+- **Backend:** Cloudflare **Worker** (Static Assets model) — `worker/index.js` routes `/api/*`, serves `dist/` via the ASSETS binding
 - **AI provider:** Google Gemini 2.5 Pro via raw REST `fetch` (no Node SDK — Workers-native)
 - **Video transcoding:** `@ffmpeg/ffmpeg` (ffmpeg.wasm) for iPhone HEVC → H.264 conversion in-browser
-- **Hosting:** Cloudflare Pages, free plan (100MB request body; no 4.5MB wall)
+- **Hosting:** Cloudflare Workers, free plan (100MB request body; no 4.5MB wall)
 
-## Architecture (implemented, on Cloudflare)
+## Architecture (implemented, on Cloudflare Workers)
 
 ```
-Browser (React, static assets on Pages)
+Browser (React, static assets served by the Worker)
   │
   │  ffmpeg.wasm transcodes HEVC → H.264 locally if needed
   │
-  ├─→ POST /api/upload         → Pages Function
+  ├─→ POST /api/upload         → Worker (worker/upload.js)
   │     raw video bytes           ├─→ starts a Gemini resumable upload session
   │     (streamed, NOT base64)    ├─→ streams body straight through (FixedLengthStream,
   │                               │    never buffered in Worker memory)
   │     ←── { name, uri,          └─→ Gemini Files API stores the video
   │           mimeType, state }
   │
-  └─→ POST /api/analyse        → Pages Function
+  └─→ POST /api/analyse        → Worker (worker/analyse.js)
         {                          ├─→ polls each file until ACTIVE
           systemPrompt,            ├─→ gemini-2.5-pro generateContent with fileData refs
           userPrompt,              ├─→ deletes uploaded files afterwards
@@ -77,10 +77,10 @@ Gemini Files API in ~5s and reached `ACTIVE`. Endpoints return correct 400s inst
 | File | Purpose |
 |---|---|
 | `src/FloorCritic.jsx` | Main React component. `uploadFileToGemini()` and `analyse()` carry `[analyse]` / `[uploadFileToGemini]` console breadcrumbs. |
-| `functions/api/upload.js` | Pages Function. Streams video bytes to the Gemini Files API, returns `{name, uri, mimeType, state}`. |
-| `functions/api/analyse.js` | Pages Function. Takes `{systemPrompt, userPrompt, files}`, polls to ACTIVE, calls gemini-2.5-pro. |
-| `public/_headers` | COOP/COEP for ffmpeg.wasm's SharedArrayBuffer (replaces `vercel.json`). Copied to `dist/` at build. |
-| `wrangler.toml` | Pages project config (`pages_build_output_dir = "dist"`). |
+| `worker/index.js` | Worker entry. Routes `/api/upload` + `/api/analyse`, serves `dist/` via ASSETS, stamps COOP/COEP. |
+| `worker/upload.js` | Streams video bytes to the Gemini Files API, returns `{name, uri, mimeType, state}`. |
+| `worker/analyse.js` | Takes `{systemPrompt, userPrompt, files}`, polls to ACTIVE, calls gemini-2.5-pro. |
+| `wrangler.toml` | Worker config: `main`, `[assets] directory/binding`, `run_worker_first`. |
 | `vite.config.js` | Same COOP/COEP headers for `vite` dev server. |
 | `package.json` | Deps: react, @ffmpeg/ffmpeg, @ffmpeg/util. Dev: vite, wrangler. |
 
@@ -91,12 +91,11 @@ Local development requires `.dev.vars` (gitignored, read by `wrangler pages dev`
 GEMINI_API_KEY=your_key_from_aistudio.google.com/apikey
 ```
 
-Cloudflare needs the same as a **secret** in Pages → Settings → Environment variables,
-set for **both** Production and Preview.
+Cloudflare needs the same as a **Secret** in the Worker → Settings → Variables and Secrets.
 
 Local commands:
 - `npm run dev` — Vite only (UI work; `/api/*` will 404)
-- `npm run cf:dev` — build + `wrangler pages dev dist` (full stack, needs Node >= 22)
+- `npm run cf:dev` — build + `wrangler dev` (full stack, needs Node >= 22)
 
 ## Product Roadmap (post-bug-fix)
 
@@ -135,16 +134,17 @@ Highest priority in rough order:
 
 ## Constraints and known limitations
 
-- **Cloudflare Pages free plan**: 100MB request body. Workers CPU limit (10ms free) counts computation only — time awaiting Gemini is I/O and doesn't count. Very long heats could still hit client/connection timeouts; if that happens, move to an async job + polling pattern backed by Workers KV.
+- **Cloudflare Workers free plan**: 100MB request body. Workers CPU limit (10ms free) counts computation only — time awaiting Gemini is I/O and doesn't count. Very long heats could still hit client/connection timeouts; if that happens, move to an async job + polling pattern backed by Workers KV.
 - **iPhone HEVC/H.265**: Safari can play these but `<canvas>.drawImage()` fails. We use ffmpeg.wasm to transcode when detected.
 - **Gemini 2.5 Pro pricing**: ~$0.05-$0.15 per analysis. Rate limits: 5/hour/IP, 50/day global (advisory, in-memory).
 - **iOS Safari upload** can be flaky for large files — needs testing on desktop Chrome before assuming it works everywhere.
 
 ## Next steps
 
-1. Set `GEMINI_API_KEY` as a secret in the Cloudflare Pages project (Production + Preview).
-2. Connect the GitHub repo in the Cloudflare dashboard — build `npm run build`, output `dist`.
-3. Add `floorcritic.com` + `www` under Pages → Custom domains (DNS already on Cloudflare).
+1. Worker → Settings → Build: Build command `npm run build`, Deploy command `npx wrangler deploy`.
+   There is no "output directory" field for Workers — `dist` comes from `[assets]` in wrangler.toml.
+2. Worker → Settings → Variables and Secrets: `GEMINI_API_KEY` as a **Secret**.
+3. Worker → Settings → Domains & Routes: add `floorcritic.com` + `www`.
 4. **Run one real 60-90s competition heat end-to-end** — the full Gemini inference path has
    not yet been exercised with real footage, only the upload path.
 5. Retire the Vercel project once the domain is live.

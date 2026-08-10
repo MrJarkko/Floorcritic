@@ -1,5 +1,0 @@
-# Cross-origin isolation — required for ffmpeg.wasm's SharedArrayBuffer.
-# Replaces the header block that used to live in vercel.json.
-/*
-  Cross-Origin-Embedder-Policy: require-corp
-  Cross-Origin-Opener-Policy: same-origin

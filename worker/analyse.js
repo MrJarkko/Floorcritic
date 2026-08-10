@@ -1,14 +1,13 @@
-// Cloudflare Pages Function — POST /api/analyse
+// POST /api/analyse
 //
-// Receives only tiny file REFERENCES (the videos were already streamed to Gemini
-// via /api/upload), waits for each to finish processing, then asks Gemini 2.5 Pro
-// to adjudicate. Uses raw fetch against the Gemini REST API — no Node SDK, so it
-// runs natively on the Workers runtime.
+// Receives only tiny file REFERENCES (videos were already streamed to Gemini via
+// /api/upload), waits for each to finish processing, then asks Gemini 2.5 Pro to
+// adjudicate. Raw fetch against the Gemini REST API — no Node SDK, Workers-native.
 
 const GEMINI = "https://generativelanguage.googleapis.com";
 const MODEL = "gemini-2.5-pro";
 
-// Best-effort in-memory rate limit (see note in upload.js — advisory only).
+// Best-effort in-memory rate limit (advisory only — see note in upload.js).
 const ipBuckets = new Map();
 const GLOBAL_LIMIT = { count: 0, resetAt: Date.now() + 24 * 3600_000, max: 50 };
 const IP_WINDOW_MS = 3600_000;
@@ -40,7 +39,7 @@ function checkRateLimit(ip) {
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
 
-// Poll the Files API until the video is ACTIVE (server-side processing takes a few seconds).
+// Poll the Files API until the video is ACTIVE (processing takes a few seconds).
 async function waitForActive(apiKey, name, maxAttempts = 60) {
   for (let i = 0; i < maxAttempts; i++) {
     const r = await fetch(`${GEMINI}/v1beta/${name}`, { headers: { "x-goog-api-key": apiKey } });
@@ -52,7 +51,7 @@ async function waitForActive(apiKey, name, maxAttempts = 60) {
   throw new Error("Timeout waiting for file to become ACTIVE");
 }
 
-export async function onRequestPost({ request, env }) {
+export async function handleAnalyse(request, env) {
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) return json({ error: "Missing GEMINI_API_KEY" }, 500);
 
@@ -73,7 +72,6 @@ export async function onRequestPost({ request, env }) {
   }
 
   try {
-    // Wait for each uploaded file to become ACTIVE.
     console.log(`Waiting for ${files.length} file(s) to be ACTIVE…`);
     const activeFiles = [];
     for (const f of files) {
